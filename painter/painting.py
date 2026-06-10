@@ -52,13 +52,25 @@ void main() {
 COLOR_TEX_WIDTH = 4096
 
 
+MAX_UNDO = 100
+
+
 class PaintState:
-    """Holds per-face color indices and mirrors them into a GPU texture."""
+    """Holds per-face color indices and mirrors them into a GPU texture.
+
+    Undo/redo: a stroke (mouse-down to mouse-up) is recorded as a diff of the
+    faces whose color actually changed, with their previous color.
+    """
 
     def __init__(self, ctx: moderngl.Context, n_faces: int):
         self.ctx = ctx
         self.n_faces = n_faces
         self.face_colors = np.zeros(n_faces, dtype="u1")
+
+        self._undo: list[tuple[np.ndarray, np.ndarray]] = []
+        self._redo: list[tuple[np.ndarray, np.ndarray]] = []
+        # -1 = ikke berørt i aktuel stroke; ellers farven før strokens start
+        self._stroke_old = np.full(n_faces, -1, dtype="i2")
 
         height = (n_faces + COLOR_TEX_WIDTH - 1) // COLOR_TEX_WIDTH
         self._tex_shape = (COLOR_TEX_WIDTH, max(height, 1))
@@ -66,14 +78,48 @@ class PaintState:
         self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self._upload()
 
+    # --- strokes ----------------------------------------------------------
+    def begin_stroke(self) -> None:
+        self._stroke_old.fill(-1)
+
+    def end_stroke(self) -> None:
+        changed = np.flatnonzero(self._stroke_old >= 0)
+        if len(changed) == 0:
+            return
+        self._undo.append((changed, self._stroke_old[changed].astype("u1")))
+        if len(self._undo) > MAX_UNDO:
+            self._undo.pop(0)
+        self._redo.clear()
+
     def set_faces(self, face_ids: np.ndarray, color_idx: int) -> None:
         if len(face_ids) == 0:
             return
+        # registrér gammel farve for faces der ændres første gang i denne stroke
+        changing = face_ids[self.face_colors[face_ids] != color_idx]
+        unrecorded = changing[self._stroke_old[changing] < 0]
+        self._stroke_old[unrecorded] = self.face_colors[unrecorded]
+
         self.face_colors[face_ids] = color_idx
         self._upload()
 
     def clear(self) -> None:
-        self.face_colors[:] = 0
+        self.begin_stroke()
+        self.set_faces(np.arange(self.n_faces), 0)
+        self.end_stroke()
+
+    # --- undo/redo --------------------------------------------------------
+    def undo(self) -> None:
+        self._swap(self._undo, self._redo)
+
+    def redo(self) -> None:
+        self._swap(self._redo, self._undo)
+
+    def _swap(self, source: list, target: list) -> None:
+        if not source:
+            return
+        faces, colors = source.pop()
+        target.append((faces, self.face_colors[faces].copy()))
+        self.face_colors[faces] = colors
         self._upload()
 
     def _upload(self) -> None:
