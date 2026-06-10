@@ -44,10 +44,18 @@ class MirrorMap:
         return f"({self.normal[0]:.2f}, {self.normal[1]:.2f}, {self.normal[2]:.2f})"
 
     def mirror(self, face_ids: np.ndarray) -> np.ndarray:
-        """Union of the faces and their mirror partners."""
-        partners = self.face_map[face_ids]
-        partners = partners[partners >= 0]
-        return np.union1d(face_ids, partners)
+        """Union of the faces and their mirror partners.
+
+        The map is used in both directions: forward (the painted face's
+        partner) AND inverse (every face whose own reflection lands in the
+        painted set). Forward alone is not surjective — faces on the mirrored
+        side that are nobody's nearest neighbor would be skipped, leaving
+        unpainted speckles.
+        """
+        forward = self.face_map[face_ids]
+        forward = forward[forward >= 0]
+        inverse = np.flatnonzero(np.isin(self.face_map, face_ids))
+        return np.union1d(np.union1d(face_ids, forward), inverse)
 
 
 def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
