@@ -19,6 +19,7 @@ Uden argument vises en demo-torus.
 | Ctrl+Z / Ctrl+Y | Undo / redo (pr. strøg) |
 | Venstre træk | **Mal** med aktuel farve (pensel) eller **fyld region** (fill mode) |
 | F | Skift mellem pensel og fill mode |
+| M | Mirror mode: maling spejles over modellens symmetriplan |
 | Højre træk | Rotér |
 | Shift+træk / midterknap | Panorér |
 | Scroll | Zoom |
@@ -33,7 +34,7 @@ Uden argument vises en demo-torus.
 1. ✅ GPU-viewer (STL/3MF/OBJ-indlæsning, orbit-kamera, flat shading)
 2. ✅ GPU-picking via face-ID-buffer + paint-brush
 3. ✅ Auto-segmentering: kantdetektion via dihedral-vinkler (PyTorch, CUDA/CPU)
-4. ⬜ Symmetri-detektion og farve-propagering
+4. ✅ Symmetri-detektion (PCA-kandidatplaner + KD-træ-verifikation) og spejlet maling
 5. ✅ 3MF-eksport med farvedata (core-spec basematerials, per-triangle)
 
 ## Arkitektur
@@ -45,3 +46,4 @@ Uden argument vises en demo-torus.
 - `painter/segmentation.py` — region-segmentering: dihedral-vinkler + connected components (torch, device-agnostisk)
 - `painter/compute.py` — runtime GPU-detektion (CUDA hvis muligt, ellers CPU) og tuning
 - `painter/export3mf.py` — 3MF-skrivning (OPC-zip med XML, per-triangle farver via basematerials)
+- `painter/symmetry.py` — spejlplan-detektion: PCA-kandidater scoret med KD-træ-nearest-neighbor og normal-konsistens

@@ -22,6 +22,7 @@ from .camera import OrbitCamera
 from .mesh import PaintMesh
 from .painting import PALETTE, PaintState, Picker
 from .segmentation import Segmenter
+from .symmetry import MirrorMap, find_mirror
 
 
 def mat_bytes(m: glm.mat4) -> bytes:
@@ -106,6 +107,7 @@ class Viewer:
         self.brush_radius = 20  # px
         self.fill_mode = False
         self.seg_angle = 25.0  # max dihedral-vinkel inden for en region
+        self.mirror_mode = False
         self._mvp_bytes = bytes(glm.mat4(1.0))
         self._vbo: moderngl.Buffer | None = None
         self._open_dialog: pfd.open_file | None = None
@@ -158,6 +160,8 @@ class Viewer:
         self.paint = PaintState(self.ctx, mesh.n_faces)
         self.picker = Picker(self.ctx, self._vbo)
         self._segmenter: Segmenter | None = None  # bygges dovent ved første fill
+        self._mirror: MirrorMap | None = None     # findes dovent ved første brug
+        self._mirror_searched = False
 
     # --- input callbacks ---------------------------------------------------
     def _on_mouse_button(self, window, button, action, mods):
@@ -230,6 +234,8 @@ class Viewer:
         elif key == glfw.KEY_F:
             self.fill_mode = not self.fill_mode
             self._update_title()
+        elif key == glfw.KEY_M:
+            self.mirror_mode = not self.mirror_mode
         elif key == glfw.KEY_C:
             self.paint.clear()
 
@@ -245,7 +251,19 @@ class Viewer:
         )
         if self.fill_mode:
             face_ids = self._expand_to_segments(face_ids)
+        if self.mirror_mode and len(face_ids):
+            mirror = self._get_mirror()
+            if mirror is not None:
+                face_ids = mirror.mirror(face_ids)
         self.paint.set_faces(face_ids, self.current_color)
+
+    def _get_mirror(self) -> MirrorMap | None:
+        if not self._mirror_searched:
+            self._mirror_searched = True
+            self._mirror = find_mirror(self.mesh)
+            if self._mirror is None:
+                self.mirror_mode = False
+        return self._mirror
 
     def _expand_to_segments(self, face_ids: np.ndarray) -> np.ndarray:
         if len(face_ids) == 0:
@@ -359,6 +377,19 @@ class Viewer:
         _, self.brush_radius = imgui.slider_int(
             "Brush size", self.brush_radius, 2, 200, "%d px"
         )
+        imgui.separator()
+
+        changed, self.mirror_mode = imgui.checkbox("Mirror (M)", self.mirror_mode)
+        if changed and self.mirror_mode:
+            self._get_mirror()  # detektér med det samme ved aktivering
+        if self.mirror_mode and self._mirror is not None:
+            imgui.same_line()
+            imgui.text_disabled(
+                f"plane {self._mirror.axis_label}, {self._mirror.match:.0%}"
+            )
+        elif self._mirror_searched and self._mirror is None:
+            imgui.same_line()
+            imgui.text_disabled("no symmetry found")
         imgui.end()
 
     def _poll_file_dialog(self) -> None:
