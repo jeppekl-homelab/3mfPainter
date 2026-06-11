@@ -53,9 +53,13 @@ class MirrorMap:
 
         Treat the dab as a ball: its centre is the mean of the painted faces'
         centroids and its radius their spread (floored at the local spacing).
-        Reflect the centre through the plane and paint every face within that
-        radius. No per-triangle correspondence, so nothing to speckle or notch —
-        the mirror is the same ball, just reflected, and matches the source.
+        Paint that ball on BOTH sides — once around the centre, once around its
+        reflection through the plane. Two balls of equal radius, so the result
+        is symmetric by construction (no triangle correspondence to speckle or
+        notch). Painting both sides also closes the seam when a stroke runs
+        along the symmetry plane: as the dab nears the plane both balls reach
+        across it and overlap, instead of leaving an unpainted strip between the
+        original brush and a lone mirror ball on the far side.
         """
         if len(face_ids) == 0:
             return face_ids
@@ -64,8 +68,15 @@ class MirrorMap:
         radius = max(float(np.linalg.norm(pts - p, axis=1).max()), self.spacing)
         n = self.normal
         p_ref = p - 2.0 * ((p - self.origin) @ n) * n
-        mirrored = self.tree.query_ball_point(p_ref, radius)
-        return np.unique(np.concatenate([face_ids, np.asarray(mirrored, dtype=np.int64)]))
+        src = self.tree.query_ball_point(p, radius)
+        mir = self.tree.query_ball_point(p_ref, radius)
+        return np.unique(
+            np.concatenate([
+                face_ids,
+                np.asarray(src, dtype=np.int64),
+                np.asarray(mir, dtype=np.int64),
+            ])
+        )
 
 
 def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
