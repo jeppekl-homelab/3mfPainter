@@ -37,11 +37,10 @@ SEAM_ITERS = 6
 
 @dataclass
 class MirrorMap:
-    centroids: np.ndarray  # (F,3) face-centroider
-    tree: cKDTree          # KD-træ over centroider, til radius-opslag
-    spacing: float         # median centroid-afstand (radius-gulv)
-    adjacency: np.ndarray  # (E,2) face-nabopar, til søm-bro
+    face_map: np.ndarray   # (F,) face på hver faces spejl-position, -1 = ingen
+    adjacency: np.ndarray  # (E,2) face-nabopar, til hul-lukning og søm-bro
     dside: np.ndarray      # (F,) signeret afstand til planet, pr. face
+    spacing: float         # median centroid-afstand (bånd-skala)
     normal: np.ndarray     # (3,) planets normal
     origin: np.ndarray     # (3,) punkt i planet
     match: float           # andel faces med makker (0..1)
@@ -54,15 +53,37 @@ class MirrorMap:
             return names[ax]
         return f"({self.normal[0]:.2f}, {self.normal[1]:.2f}, {self.normal[2]:.2f})"
 
+    def _fill_holes(self, faces: np.ndarray, passes: int = 2) -> np.ndarray:
+        """Fill fully-enclosed gaps (faces whose every edge-neighbor is painted).
+
+        Forward correspondence maps several source faces onto one mirror face,
+        leaving the odd interior face blank; filling only fully-surrounded faces
+        closes those speckles without growing the region's outer boundary.
+        """
+        adj = self.adjacency
+        if len(adj) == 0 or len(faces) == 0:
+            return faces
+        n = len(self.dside)
+        a, b = adj[:, 0], adj[:, 1]
+        deg = np.bincount(a, minlength=n) + np.bincount(b, minlength=n)
+        for _ in range(passes):
+            painted = np.zeros(n, dtype=bool)
+            painted[faces] = True
+            pnb = np.bincount(a, painted[b], n) + np.bincount(b, painted[a], n)
+            holes = np.flatnonzero((~painted) & (deg > 0) & (pnb >= deg))
+            if len(holes) == 0:
+                break
+            faces = np.union1d(faces, holes)
+        return faces
+
     def _bridge_seam(self, faces: np.ndarray) -> np.ndarray:
         """Fill faces straddling the plane that connect the two painted halves.
 
-        The ball mirror can leave an unpainted strip right on the symmetry plane
-        when a stroke runs near it: the source reaches the plane from one side
-        and the mirror from the other, but the faces the plane cuts through stay
-        blank. We grow paint INTO that band only through faces that have painted
-        neighbors on BOTH sides of the plane — so the gap is bridged without
-        spreading paint along the plane past the stroke.
+        A stroke running near the plane leaves the faces the plane cuts through
+        blank — the source reaches it from one side, the mirror from the other.
+        Grow paint into that band only through faces that have painted neighbors
+        on BOTH sides of the plane, so the gap is bridged without spreading paint
+        along the plane past the stroke.
         """
         adj = self.adjacency
         if len(adj) == 0:
@@ -85,33 +106,65 @@ class MirrorMap:
         return np.flatnonzero(painted)
 
     def mirror(self, face_ids: np.ndarray) -> np.ndarray:
-        """The painted faces plus a geometric mirror of the brush dab.
+        """The painted faces plus their mirror, by face correspondence.
 
-        Treat the dab as a ball: its centre is the mean of the painted faces'
-        centroids and its radius their spread (floored at the local spacing).
-        Paint that ball on BOTH sides — once around the centre, once around its
-        reflection through the plane — so the result is symmetric by construction
-        (no triangle correspondence to speckle or notch). Then bridge any
-        unpainted strip the plane cuts through (see _bridge_seam) so the two
-        halves connect when the stroke runs along the symmetry plane.
+        The source stays exactly the brushed faces (no radius ball — a 3D ball
+        engulfs whole tall triangles and spikes the edge). Each painted face is
+        mirrored to the face that sits at its reflected position; a hole-fill
+        closes the speckles that the many-to-one mapping leaves, and a seam
+        bridge connects the two halves across the plane.
         """
         if len(face_ids) == 0:
             return face_ids
-        pts = self.centroids[face_ids]
-        p = pts.mean(axis=0)
-        radius = max(float(np.linalg.norm(pts - p, axis=1).max()), self.spacing)
-        n = self.normal
-        p_ref = p - 2.0 * ((p - self.origin) @ n) * n
-        src = self.tree.query_ball_point(p, radius)
-        mir = self.tree.query_ball_point(p_ref, radius)
-        result = np.unique(
-            np.concatenate([
-                face_ids,
-                np.asarray(src, dtype=np.int64),
-                np.asarray(mir, dtype=np.int64),
-            ])
-        )
+        forward = self.face_map[face_ids]
+        forward = forward[forward >= 0]
+        result = np.union1d(face_ids, forward)
+        result = self._fill_holes(result)
         return self._bridge_seam(result)
+
+
+def _containing_face(
+    points: np.ndarray, tree: cKDTree, tri: np.ndarray, k: int = 8
+) -> tuple[np.ndarray, np.ndarray]:
+    """For each point, the triangle that contains it (projected), and its distance.
+
+    Among the k nearest face centroids, test which triangle actually contains
+    the point (barycentric, projected onto the triangle plane) and pick the one
+    it sits closest to the plane of. This is robust where nearest-centroid fails
+    (e.g. a point near a quad diagonal). Points contained by no candidate fall
+    back to the nearest centroid.
+    """
+    k = min(k, tri.shape[0])
+    _, idx = tree.query(points, k=k, workers=-1)
+    if idx.ndim == 1:
+        idx = idx[:, None]
+    a, b, c = tri[idx, 0], tri[idx, 1], tri[idx, 2]      # (N, k, 3)
+    p = points[:, None, :]
+    v0, v1, v2 = b - a, c - a, p - a
+    d00 = (v0 * v0).sum(-1)
+    d01 = (v0 * v1).sum(-1)
+    d11 = (v1 * v1).sum(-1)
+    d20 = (v2 * v0).sum(-1)
+    d21 = (v2 * v1).sum(-1)
+    denom = d00 * d11 - d01 * d01
+    denom = np.where(np.abs(denom) < 1e-20, 1e-20, denom)
+    v = (d11 * d20 - d01 * d21) / denom
+    w = (d00 * d21 - d01 * d20) / denom
+    u = 1.0 - v - w
+    eps = 1e-6
+    inside = (u >= -eps) & (v >= -eps) & (w >= -eps)     # (N, k)
+    nf = np.cross(v0, v1)
+    nf /= np.maximum(np.linalg.norm(nf, axis=-1, keepdims=True), 1e-12)
+    perp = np.abs((v2 * nf).sum(-1))                     # afstand til trekantplanet
+    score = np.where(inside, perp, np.inf)
+    best = np.argmin(score, axis=1)
+    rows = np.arange(len(points))
+    chosen = idx[rows, best].copy()
+    dist = score[rows, best].copy()
+    none = ~inside.any(axis=1)
+    chosen[none] = idx[none, 0]
+    dist[none] = np.linalg.norm(points[none] - tri[idx[none, 0]].mean(1), axis=1)
+    return chosen, dist
 
 
 def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
@@ -161,8 +214,18 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     tm = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
     adjacency = np.asarray(tm.face_adjacency, dtype=np.int64)
     dside = (centroids - center) @ best_n
+
+    # spejl-partner pr. face: hvilken trekant INDEHOLDER den reflekterede centroid
+    reflected = centroids - 2.0 * ((d @ best_n)[:, None] * best_n)
+    tri = mesh.vertices[mesh.faces]
+    idx, sdist = _containing_face(reflected, tree, tri)
+    mirrored_n = normals - 2.0 * ((normals @ best_n)[:, None] * best_n)
+    normal_ok = (mirrored_n * normals[idx]).sum(axis=1) >= NORMAL_AGREEMENT
+    ok = (sdist <= TOLERANCE_FACE_SCALE * face_scale[idx]) & normal_ok
+    face_map = np.where(ok, idx, -1).astype(np.int64)
+
     best = MirrorMap(
-        centroids, tree, spacing, adjacency, dside, best_n, center, best_match
+        face_map, adjacency, dside, spacing, best_n, center, best_match
     )
 
     print(
