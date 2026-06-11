@@ -86,6 +86,21 @@ void main() {
 }
 """
 
+# Debug-overlay: tegner det detekterede spejlplan som en gennemsigtig flade
+PLANE_VERTEX_SHADER = """
+#version 410
+uniform mat4 u_mvp;
+in vec3 in_position;
+void main() { gl_Position = u_mvp * vec4(in_position, 1.0); }
+"""
+
+PLANE_FRAGMENT_SHADER = """
+#version 410
+uniform vec4 u_color;
+out vec4 frag_color;
+void main() { frag_color = u_color; }
+"""
+
 
 class Viewer:
     def __init__(self, mesh: PaintMesh, title: str = "3mf Painter"):
@@ -110,6 +125,12 @@ class Viewer:
         self.prog = self.ctx.program(
             vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER
         )
+        self.plane_prog = self.ctx.program(
+            vertex_shader=PLANE_VERTEX_SHADER, fragment_shader=PLANE_FRAGMENT_SHADER
+        )
+        self._plane_vbo: moderngl.Buffer | None = None
+        self._plane_vao: moderngl.VertexArray | None = None
+        self.show_plane = True  # vis spejlplanet når mirror er aktivt
 
         self.palette = Palette()
         self.current_color = 1
@@ -173,6 +194,10 @@ class Viewer:
         self._segmenter: Segmenter | None = None  # bygges dovent ved første fill
         self._mirror: MirrorMap | None = None     # findes dovent ved første brug
         self._mirror_searched = False
+        if self._plane_vao is not None:           # spejlplan-overlay bygges på ny
+            self._plane_vao.release()
+            self._plane_vbo.release()
+            self._plane_vao = None
 
     # --- input callbacks ---------------------------------------------------
     def _on_mouse_button(self, window, button, action, mods):
@@ -298,6 +323,27 @@ class Viewer:
             if self._mirror is None:
                 self.mirror_mode = False
         return self._mirror
+
+    def _build_plane(self) -> None:
+        """Build a translucent quad lying in the detected mirror plane."""
+        m = self._mirror
+        n = np.asarray(m.normal, dtype="f8")
+        n = n / max(np.linalg.norm(n), 1e-12)
+        o = np.asarray(m.origin, dtype="f8")
+        # to akser i planet (vilkårligt orienteret, vinkelret på normalen)
+        ref = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u = np.cross(n, ref); u /= np.linalg.norm(u)
+        v = np.cross(n, u)
+        r = self.mesh.radius * 1.5
+        c = [o + (-u - v) * r, o + (u - v) * r, o + (u + v) * r, o + (-u + v) * r]
+        quad = np.array([c[0], c[1], c[2], c[0], c[2], c[3]], dtype="f4")
+        if self._plane_vao is not None:
+            self._plane_vao.release()
+            self._plane_vbo.release()
+        self._plane_vbo = self.ctx.buffer(quad.tobytes())
+        self._plane_vao = self.ctx.vertex_array(
+            self.plane_prog, [(self._plane_vbo, "3f", "in_position")]
+        )
 
     def _expand_to_segments(self, face_ids: np.ndarray) -> np.ndarray:
         if len(face_ids) == 0:
@@ -436,6 +482,8 @@ class Viewer:
         elif self._mirror_searched and self._mirror is None:
             imgui.same_line()
             imgui.text_disabled("no symmetry found")
+        if self.mirror_mode and self._mirror is not None:
+            _, self.show_plane = imgui.checkbox("Show mirror plane", self.show_plane)
         imgui.end()
 
     def _poll_file_dialog(self) -> None:
@@ -501,3 +549,13 @@ class Viewer:
         self.hover.texture.use(location=1)
         self.prog["u_hover"].value = 1
         self.vao.render(moderngl.TRIANGLES)
+
+        # debug: tegn det detekterede spejlplan som en gennemsigtig blå flade
+        if self.show_plane and self.mirror_mode and self._mirror is not None:
+            if self._plane_vao is None:
+                self._build_plane()
+            self.plane_prog["u_mvp"].write(self._mvp_bytes)
+            self.plane_prog["u_color"].value = (0.25, 0.6, 1.0, 0.28)
+            self.ctx.enable_only(moderngl.DEPTH_TEST | moderngl.BLEND)  # dobbeltsidet
+            self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+            self._plane_vao.render(moderngl.TRIANGLES)
