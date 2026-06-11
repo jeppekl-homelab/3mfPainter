@@ -88,6 +88,52 @@ def _face_adjacency(mesh: PaintMesh) -> np.ndarray:
     return np.asarray(tm.face_adjacency, dtype=np.int64)
 
 
+def _containing_face(
+    points: np.ndarray, tree: cKDTree, tri: np.ndarray, k: int = 8
+) -> tuple[np.ndarray, np.ndarray]:
+    """For each point, the triangle that contains it (projected), and its distance.
+
+    Nearest-centroid matching fails near a quad's diagonal: the reflected point
+    lands inside one triangle, but the other triangle's centroid may be closer,
+    so contiguous regions mirror to ragged ones. Instead, among the k nearest
+    centroids, test which triangle actually contains the point (barycentric,
+    projected onto the triangle plane) and pick the one it sits closest to the
+    plane of. Faces that contain no candidate fall back to the nearest centroid.
+    """
+    k = min(k, tri.shape[0])
+    _, idx = tree.query(points, k=k, workers=-1)
+    if idx.ndim == 1:
+        idx = idx[:, None]
+    a, b, c = tri[idx, 0], tri[idx, 1], tri[idx, 2]      # (N, k, 3)
+    p = points[:, None, :]
+    v0, v1, v2 = b - a, c - a, p - a
+    d00 = (v0 * v0).sum(-1)
+    d01 = (v0 * v1).sum(-1)
+    d11 = (v1 * v1).sum(-1)
+    d20 = (v2 * v0).sum(-1)
+    d21 = (v2 * v1).sum(-1)
+    denom = d00 * d11 - d01 * d01
+    denom = np.where(np.abs(denom) < 1e-20, 1e-20, denom)
+    v = (d11 * d20 - d01 * d21) / denom
+    w = (d00 * d21 - d01 * d20) / denom
+    u = 1.0 - v - w
+    eps = 1e-6
+    inside = (u >= -eps) & (v >= -eps) & (w >= -eps)     # (N, k)
+    nf = np.cross(v0, v1)
+    nf /= np.maximum(np.linalg.norm(nf, axis=-1, keepdims=True), 1e-12)
+    perp = np.abs((v2 * nf).sum(-1))                     # afstand til trekantplanet
+    score = np.where(inside, perp, np.inf)
+    best = np.argmin(score, axis=1)
+    rows = np.arange(len(points))
+    chosen = idx[rows, best].copy()
+    dist = score[rows, best].copy()
+    # punkter uden nogen indeholdende kandidat: fald tilbage til nærmeste centroid
+    none = ~inside.any(axis=1)
+    chosen[none] = idx[none, 0]
+    dist[none] = np.linalg.norm(points[none] - tri[idx[none, 0]].mean(1), axis=1)
+    return chosen, dist
+
+
 def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     t0 = time.perf_counter()
     verts = mesh.vertices[mesh.faces]              # (F, 3, 3)
@@ -113,25 +159,37 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     normals = cross / np.maximum(np.linalg.norm(cross, axis=1, keepdims=True), 1e-12)
     adjacency = _face_adjacency(mesh)
 
-    best: MirrorMap | None = None
+    # 1) hurtig scoring med centroid-NN for at vælge det bedste kandidatplan
+    best_n: np.ndarray | None = None
+    best_match = 0.0
     for n in unique:
         reflected = centroids - 2.0 * ((d @ n)[:, None] * n)
         dist, idx = tree.query(reflected, workers=-1)
-        # spejlet normal: reflektér normalvektoren i planet
         mirrored_n = normals - 2.0 * ((normals @ n)[:, None] * n)
         normal_ok = (mirrored_n * normals[idx]).sum(axis=1) >= NORMAL_AGREEMENT
         ok = (dist <= TOLERANCE_FACE_SCALE * face_scale[idx]) & normal_ok
         match = float(ok.mean())
-        if match >= ACCEPT_FRACTION and (best is None or match > best.match):
-            face_map = np.where(ok, idx, -1).astype(np.int64)
-            best = MirrorMap(face_map, adjacency, n.copy(), center, match)
+        if match >= ACCEPT_FRACTION and match > best_match:
+            best_match, best_n = match, n.copy()
 
     elapsed = time.perf_counter() - t0
-    if best is None:
+    if best_n is None:
         print(f"Symmetri: intet spejlplan fundet ({elapsed:.2f}s)")
-    else:
-        print(
-            f"Symmetri: spejlplan {best.axis_label}, "
-            f"{best.match:.1%} match ({elapsed:.2f}s)"
-        )
+        return None
+
+    # 2) nøjagtig partner pr. face for det valgte plan: hvilken trekant INDEHOLDER
+    #    det spejlede punkt (ikke blot nærmeste centroid) — fjerner hakkede kanter
+    reflected = centroids - 2.0 * ((d @ best_n)[:, None] * best_n)
+    tri = mesh.vertices[mesh.faces]
+    idx, sdist = _containing_face(reflected, tree, tri)
+    mirrored_n = normals - 2.0 * ((normals @ best_n)[:, None] * best_n)
+    normal_ok = (mirrored_n * normals[idx]).sum(axis=1) >= NORMAL_AGREEMENT
+    ok = (sdist <= TOLERANCE_FACE_SCALE * face_scale[idx]) & normal_ok
+    face_map = np.where(ok, idx, -1).astype(np.int64)
+    best = MirrorMap(face_map, adjacency, best_n, center, best_match)
+
+    print(
+        f"Symmetri: spejlplan {best.axis_label}, "
+        f"{best.match:.1%} match ({time.perf_counter() - t0:.2f}s)"
+    )
     return best
