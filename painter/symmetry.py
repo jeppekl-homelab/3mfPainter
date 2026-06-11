@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
+import trimesh
 from scipy.spatial import cKDTree
 
 from .mesh import PaintMesh
@@ -29,6 +30,9 @@ ACCEPT_FRACTION = 0.85
 TOLERANCE_FACE_SCALE = 1.0
 # spejlet normal skal pege samme vej som makkerens normal
 NORMAL_AGREEMENT = 0.8
+# søm-bro: bånd-bredde (i centroid-afstande) og maks. iterationer
+SEAM_BAND = 3.0
+SEAM_ITERS = 6
 
 
 @dataclass
@@ -36,6 +40,8 @@ class MirrorMap:
     centroids: np.ndarray  # (F,3) face-centroider
     tree: cKDTree          # KD-træ over centroider, til radius-opslag
     spacing: float         # median centroid-afstand (radius-gulv)
+    adjacency: np.ndarray  # (E,2) face-nabopar, til søm-bro
+    dside: np.ndarray      # (F,) signeret afstand til planet, pr. face
     normal: np.ndarray     # (3,) planets normal
     origin: np.ndarray     # (3,) punkt i planet
     match: float           # andel faces med makker (0..1)
@@ -48,18 +54,46 @@ class MirrorMap:
             return names[ax]
         return f"({self.normal[0]:.2f}, {self.normal[1]:.2f}, {self.normal[2]:.2f})"
 
+    def _bridge_seam(self, faces: np.ndarray) -> np.ndarray:
+        """Fill faces straddling the plane that connect the two painted halves.
+
+        The ball mirror can leave an unpainted strip right on the symmetry plane
+        when a stroke runs near it: the source reaches the plane from one side
+        and the mirror from the other, but the faces the plane cuts through stay
+        blank. We grow paint INTO that band only through faces that have painted
+        neighbors on BOTH sides of the plane — so the gap is bridged without
+        spreading paint along the plane past the stroke.
+        """
+        adj = self.adjacency
+        if len(adj) == 0:
+            return faces
+        n = len(self.dside)
+        painted = np.zeros(n, dtype=bool)
+        painted[faces] = True
+        band = np.abs(self.dside) < SEAM_BAND * self.spacing
+        a, b = adj[:, 0], adj[:, 1]
+        da, db = self.dside[a], self.dside[b]
+        for _ in range(SEAM_ITERS):
+            pos = (np.bincount(b, (painted[a] & (da > 0)).astype(float), n)
+                   + np.bincount(a, (painted[b] & (db > 0)).astype(float), n)) > 0
+            neg = (np.bincount(b, (painted[a] & (da < 0)).astype(float), n)
+                   + np.bincount(a, (painted[b] & (db < 0)).astype(float), n)) > 0
+            bridge = (~painted) & band & pos & neg
+            if not bridge.any():
+                break
+            painted[bridge] = True
+        return np.flatnonzero(painted)
+
     def mirror(self, face_ids: np.ndarray) -> np.ndarray:
         """The painted faces plus a geometric mirror of the brush dab.
 
         Treat the dab as a ball: its centre is the mean of the painted faces'
         centroids and its radius their spread (floored at the local spacing).
         Paint that ball on BOTH sides — once around the centre, once around its
-        reflection through the plane. Two balls of equal radius, so the result
-        is symmetric by construction (no triangle correspondence to speckle or
-        notch). Painting both sides also closes the seam when a stroke runs
-        along the symmetry plane: as the dab nears the plane both balls reach
-        across it and overlap, instead of leaving an unpainted strip between the
-        original brush and a lone mirror ball on the far side.
+        reflection through the plane — so the result is symmetric by construction
+        (no triangle correspondence to speckle or notch). Then bridge any
+        unpainted strip the plane cuts through (see _bridge_seam) so the two
+        halves connect when the stroke runs along the symmetry plane.
         """
         if len(face_ids) == 0:
             return face_ids
@@ -70,13 +104,14 @@ class MirrorMap:
         p_ref = p - 2.0 * ((p - self.origin) @ n) * n
         src = self.tree.query_ball_point(p, radius)
         mir = self.tree.query_ball_point(p_ref, radius)
-        return np.unique(
+        result = np.unique(
             np.concatenate([
                 face_ids,
                 np.asarray(src, dtype=np.int64),
                 np.asarray(mir, dtype=np.int64),
             ])
         )
+        return self._bridge_seam(result)
 
 
 def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
@@ -123,7 +158,12 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
 
     nn_dist, _ = tree.query(centroids, k=2, workers=-1)   # [:,1] = nærmeste nabo
     spacing = float(np.median(nn_dist[:, 1]))
-    best = MirrorMap(centroids, tree, spacing, best_n, center, best_match)
+    tm = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
+    adjacency = np.asarray(tm.face_adjacency, dtype=np.int64)
+    dside = (centroids - center) @ best_n
+    best = MirrorMap(
+        centroids, tree, spacing, adjacency, dside, best_n, center, best_match
+    )
 
     print(
         f"Symmetri: spejlplan {best.axis_label}, "
