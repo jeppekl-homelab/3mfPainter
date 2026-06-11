@@ -27,6 +27,8 @@ ACCEPT_FRACTION = 0.85
 TOLERANCE_FACE_SCALE = 1.0
 # spejlet normal skal pege samme vej som makkerens normal
 NORMAL_AGREEMENT = 0.8
+# maks. iterationer i den symmetriske lukning (konvergerer typisk på 3-6)
+MIRROR_CLOSURE_ITERS = 16
 
 
 @dataclass
@@ -68,17 +70,27 @@ class MirrorMap:
         return np.union1d(faces, holes)
 
     def mirror(self, face_ids: np.ndarray) -> np.ndarray:
-        """The painted faces plus their mirror image, as a clean region.
+        """Paint the faces and their mirror image as a symmetric, gap-free region.
 
-        Uses the map in the INVERSE direction: a target face is mirrored-in
-        when its own reflection lands on a painted face. Evaluating it per
-        target face fills the reflected region completely (no speckle holes)
-        and — unlike the forward direction — never drags in a lone outlier
-        triangle whose partner sits just outside the painted set. A final
-        hole-fill closes the rare pinholes left by partnerless faces.
+        A chiral triangulation (e.g. a torus) has no exact triangle-level mirror
+        involution: the diagonal that splits each quad flips under reflection, so
+        any single-pass mapping leaves a one-triangle notch on one side. We close
+        the set under the partner map in BOTH directions until it stops growing —
+        forward (each face's partner) and inverse (each face whose partner is in
+        the set). The fixed point is area-symmetric: the two sides end up exactly
+        balanced with no notch and no speckle holes, at the cost of a slight but
+        symmetric thickening of the stroke. A final hole-fill is a cheap belt-and-
+        suspenders against any remaining enclosed pinhole.
         """
-        inverse = np.flatnonzero(np.isin(self.face_map, face_ids))
-        result = np.union1d(face_ids, inverse)
+        result = np.unique(face_ids)
+        for _ in range(MIRROR_CLOSURE_ITERS):
+            partners = self.face_map[result]
+            partners = partners[partners >= 0]
+            inverse = np.flatnonzero(np.isin(self.face_map, result))
+            grown = np.union1d(np.union1d(result, partners), inverse)
+            if len(grown) == len(result):
+                break
+            result = grown
         return self._fill_holes(result)
 
 
