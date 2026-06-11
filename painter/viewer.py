@@ -20,7 +20,7 @@ from . import export3mf
 from . import mesh as mesh_io
 from .camera import OrbitCamera
 from .mesh import PaintMesh
-from .painting import PALETTE, PaintState, Picker
+from .painting import Palette, PaintState, Picker, HoverHighlight
 from .segmentation import Segmenter
 from .symmetry import MirrorMap, find_mirror
 
@@ -53,8 +53,9 @@ void main() {
 FRAGMENT_SHADER = """
 #version 410
 uniform vec3 u_camera_pos;
-uniform vec3 u_palette[9];
+uniform vec3 u_palette[6];
 uniform usampler2D u_face_colors;
+uniform usampler2D u_hover;
 
 in vec3 v_normal;
 in vec3 v_world_pos;
@@ -64,8 +65,9 @@ out vec4 frag_color;
 
 void main() {
     int fid = int(v_face_id);
-    uint cidx = texelFetch(u_face_colors, ivec2(fid % 4096, fid / 4096), 0).r;
-    vec3 base = u_palette[min(cidx, 8u)];
+    ivec2 texel = ivec2(fid % 4096, fid / 4096);
+    uint cidx = texelFetch(u_face_colors, texel, 0).r;
+    vec3 base = u_palette[min(cidx, 5u)];
 
     vec3 n = normalize(v_normal);
     vec3 view_dir = normalize(u_camera_pos - v_world_pos);
@@ -74,7 +76,13 @@ void main() {
                   + max(n.y, 0.0) * 0.15;
     vec3 color = base * (0.15 + diffuse);
     float spec = pow(max(dot(n, view_dir), 0.0), 48.0) * 0.25;
-    frag_color = vec4(color + spec, 1.0);
+    color += spec;
+
+    // fill-mode hover: lys den region op som et klik ville farve
+    if (texelFetch(u_hover, texel, 0).r != 0u) {
+        color = mix(color, vec3(1.0, 1.0, 0.6), 0.35);
+    }
+    frag_color = vec4(color, 1.0);
 }
 """
 
@@ -103,6 +111,7 @@ class Viewer:
             vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER
         )
 
+        self.palette = Palette()
         self.current_color = 1
         self.brush_radius = 20  # px
         self.fill_mode = False
@@ -137,6 +146,7 @@ class Viewer:
             self.vao.release()
             self.picker.vao.release()
             self.paint.texture.release()
+            self.hover.texture.release()
             self._vbo.release()
 
         self.mesh = mesh
@@ -159,6 +169,7 @@ class Viewer:
         self.vao = self.ctx.vertex_array(self.prog, fmt)
         self.paint = PaintState(self.ctx, mesh.n_faces)
         self.picker = Picker(self.ctx, self._vbo)
+        self.hover = HoverHighlight(self.ctx, mesh.n_faces)
         self._segmenter: Segmenter | None = None  # bygges dovent ved første fill
         self._mirror: MirrorMap | None = None     # findes dovent ved første brug
         self._mirror_searched = False
@@ -175,6 +186,7 @@ class Viewer:
             else:
                 if pressed and not self._painting:
                     self._painting = True
+                    self.hover.clear()
                     self.paint.begin_stroke()
                     self._paint_at(*glfw.get_cursor_pos(window))
                 elif not pressed and self._painting:
@@ -193,6 +205,7 @@ class Viewer:
                 self._painting = False
                 self.paint.end_stroke()
             self._rotating = self._panning = False
+            self.hover.clear()
             return
         if self._last_cursor is None:
             self._last_cursor = (x, y)
@@ -205,6 +218,10 @@ class Viewer:
             self.camera.pan(dx, dy)
         elif self._painting:
             self._paint_at(x, y)
+        elif self.fill_mode:
+            self._hover_at(x, y)
+        else:
+            self.hover.clear()
 
     def _on_scroll(self, window, dx, dy):
         if imgui.get_io().want_capture_mouse:
@@ -228,11 +245,13 @@ class Viewer:
             self.paint.undo()
         elif ctrl and key == glfw.KEY_Y:
             self.paint.redo()
-        elif glfw.KEY_0 <= key <= glfw.KEY_8:
+        elif glfw.KEY_0 <= key <= glfw.KEY_5:
             self.current_color = key - glfw.KEY_0  # 0 = viskelæder/umalet
             self._update_title()
         elif key == glfw.KEY_F:
             self.fill_mode = not self.fill_mode
+            if not self.fill_mode:
+                self.hover.clear()
             self._update_title()
         elif key == glfw.KEY_M:
             self.mirror_mode = not self.mirror_mode
@@ -256,6 +275,21 @@ class Viewer:
             if mirror is not None:
                 face_ids = mirror.mirror(face_ids)
         self.paint.set_faces(face_ids, self.current_color)
+
+    def _hover_at(self, x: float, y: float) -> None:
+        """Highlight the region a fill-mode click would paint (incl. mirror)."""
+        w, h = glfw.get_framebuffer_size(self.window)
+        ww, wh = glfw.get_window_size(self.window)
+        if h == 0 or wh == 0:
+            return
+        scale = h / wh
+        face_ids = self.picker.pick(self._mvp_bytes, (w, h), (x * scale, y * scale), 2)
+        face_ids = self._expand_to_segments(face_ids)
+        if self.mirror_mode and len(face_ids):
+            mirror = self._get_mirror()
+            if mirror is not None:
+                face_ids = mirror.mirror(face_ids)
+        self.hover.set(face_ids)
 
     def _get_mirror(self) -> MirrorMap | None:
         if not self._mirror_searched:
@@ -306,17 +340,17 @@ class Viewer:
 
         if imgui.begin_main_menu_bar():
             if imgui.begin_menu("File"):
-                clicked, _ = imgui.menu_item("Import STL...", "", False)
+                clicked, _ = imgui.menu_item("Open... (STL/OBJ/3MF)", "", False)
                 if clicked and self._open_dialog is None:
                     self._open_dialog = pfd.open_file(
-                        "Import STL",
+                        "Open model or project",
                         "",
-                        ["STL-filer", "*.stl", "Alle mesh-filer", "*.stl *.3mf *.obj"],
+                        ["Mesh & projekter", "*.stl *.3mf *.obj", "Alle filer", "*"],
                     )
-                clicked, _ = imgui.menu_item("Export 3MF...", "", False)
+                clicked, _ = imgui.menu_item("Save project (3MF)...", "", False)
                 if clicked and self._save_dialog is None:
                     self._save_dialog = pfd.save_file(
-                        "Export 3MF", "model.3mf", ["3MF-filer", "*.3mf"]
+                        "Save project (3MF)", "model.3mf", ["3MF-filer", "*.3mf"]
                     )
                 imgui.end_menu()
             if imgui.begin_menu("Edit"):
@@ -339,10 +373,11 @@ class Viewer:
         imgui.set_next_window_pos((10, 35), imgui.Cond_.first_use_ever)
         imgui.begin("Tools", None, imgui.WindowFlags_.always_auto_resize)
 
-        imgui.text("Color")
-        for i in range(len(PALETTE)):
+        imgui.text("Colors")
+        n = self.palette.size
+        for i in range(n):
             imgui.push_id(i)
-            r, g, b = PALETTE[i]
+            r, g, b = self.palette.colors[i]
             flags = imgui.ColorEditFlags_.no_tooltip
             if imgui.color_button("##color", imgui.ImVec4(r, g, b, 1.0), flags, (28, 28)):
                 self.current_color = i
@@ -356,13 +391,24 @@ class Viewer:
                     rounding=0.0, thickness=2.0,
                 )
             imgui.pop_id()
-            if i != len(PALETTE) - 1:
+            if i != n - 1:
                 imgui.same_line()
         imgui.text("(0 = eraser/unpainted)")
+        if self.current_color != 0:
+            col = self.palette.colors[self.current_color]
+            imgui.set_next_item_width(200)
+            changed, new = imgui.color_edit3(
+                f"Slot {self.current_color}",
+                (float(col[0]), float(col[1]), float(col[2])),
+            )
+            if changed:
+                self.palette.colors[self.current_color] = new
         imgui.separator()
 
         changed, self.fill_mode = imgui.checkbox("Fill mode (F)", self.fill_mode)
         if changed:
+            if not self.fill_mode:
+                self.hover.clear()
             self._update_title()
         imgui.set_next_item_width(160)
         _, self.seg_angle = imgui.slider_float(
@@ -397,13 +443,7 @@ class Viewer:
             paths = self._open_dialog.result()
             self._open_dialog = None
             if paths:
-                path = paths[0]
-                print(f"Importerer {path} ...")
-                try:
-                    self.set_mesh(mesh_io.load(path))
-                    print(f"Faces:    {self.mesh.n_faces:,}")
-                except Exception as exc:  # ødelagt fil må ikke crashe appen
-                    print(f"Kunne ikke indlæse {path}: {exc}")
+                self._open(paths[0])
 
         if self._save_dialog is not None and self._save_dialog.ready():
             path = self._save_dialog.result()
@@ -412,9 +452,31 @@ class Viewer:
                 if not path.lower().endswith(".3mf"):
                     path += ".3mf"
                 try:
-                    export3mf.export(self.mesh, self.paint.face_colors, path)
+                    export3mf.export(
+                        self.mesh, self.paint.face_colors, self.palette.colors, path
+                    )
                 except Exception as exc:
                     print(f"Eksport fejlede: {exc}")
+
+    def _open(self, path: str) -> None:
+        """Load a mesh; a .3mf with paint data restores colors + palette too."""
+        print(f"Åbner {path} ...")
+        if path.lower().endswith(".3mf"):
+            try:
+                mesh, face_colors, palette_cols = export3mf.load_project(path)
+                self.set_mesh(mesh)
+                if palette_cols is not None:
+                    self.palette.set_slots(palette_cols)
+                self.paint.load_colors(face_colors)
+                return
+            except Exception as exc:
+                # fremmed/ukurant 3MF: fald tilbage til ren geometri
+                print(f"Kunne ikke læse maledata ({exc}); indlæser kun geometri")
+        try:
+            self.set_mesh(mesh_io.load(path))
+            print(f"Faces:    {self.mesh.n_faces:,}")
+        except Exception as exc:  # ødelagt fil må ikke crashe appen
+            print(f"Kunne ikke indlæse {path}: {exc}")
 
     def _render(self) -> None:
         w, h = glfw.get_framebuffer_size(self.window)
@@ -433,7 +495,9 @@ class Viewer:
         self.prog["u_mvp"].write(self._mvp_bytes)
         self.prog["u_model"].write(mat_bytes(model))
         self.prog["u_camera_pos"].value = tuple(self.camera.position())
-        self.prog["u_palette"].write(PALETTE.tobytes())
+        self.prog["u_palette"].write(self.palette.colors.tobytes())
         self.paint.texture.use(location=0)
         self.prog["u_face_colors"].value = 0
+        self.hover.texture.use(location=1)
+        self.prog["u_hover"].value = 1
         self.vao.render(moderngl.TRIANGLES)

@@ -43,6 +43,21 @@ def demo() -> PaintMesh:
     return _prepare(mesh)
 
 
+def build(vertices, faces) -> PaintMesh:
+    """Build a PaintMesh from explicit arrays, preserving triangle order.
+
+    Used when reloading a painted .3mf: per-face colors are indexed by the
+    order triangles appear in the file, so trimesh's processing (which may
+    merge/reorder vertices and faces) must be disabled.
+    """
+    tm = trimesh.Trimesh(
+        np.asarray(vertices, dtype="f8"),
+        np.asarray(faces, dtype="i8"),
+        process=False,
+    )
+    return _prepare(tm)
+
+
 def _prepare(mesh: trimesh.Trimesh) -> PaintMesh:
     faces = np.asarray(mesh.faces)
     verts = np.asarray(mesh.vertices)

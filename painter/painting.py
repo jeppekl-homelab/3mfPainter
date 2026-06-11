@@ -11,21 +11,41 @@ from __future__ import annotations
 import numpy as np
 import moderngl
 
-# Filament-agtig palette; index 0 er "umalet" (grundfarve)
-PALETTE = np.array(
+# Filament-agtig standardpalette; index 0 er "umalet" (grundfarve), 1..5 males.
+DEFAULT_COLORS = np.array(
     [
-        [0.78, 0.80, 0.85],  # 0: umalet
+        [0.78, 0.80, 0.85],  # 0: umalet / viskelæder
         [0.90, 0.12, 0.14],  # 1: rød
         [0.13, 0.45, 0.85],  # 2: blå
         [0.16, 0.65, 0.27],  # 3: grøn
         [0.95, 0.77, 0.06],  # 4: gul
         [0.93, 0.45, 0.13],  # 5: orange
-        [0.55, 0.20, 0.70],  # 6: lilla
-        [0.10, 0.10, 0.10],  # 7: sort
-        [0.97, 0.97, 0.97],  # 8: hvid
     ],
     dtype="f4",
 )
+
+
+class Palette:
+    """Mutable color palette: index 0 = unpainted, indices 1..5 = paint slots.
+
+    Always exactly 6 rows so the shader uniform and 3MF export stay fixed-size;
+    the paint slots are editable via the UI's color picker and restored on load.
+    """
+
+    MAX_SLOTS = 5
+
+    def __init__(self) -> None:
+        self.colors = DEFAULT_COLORS.copy()  # (6, 3) float32
+
+    @property
+    def size(self) -> int:
+        return len(self.colors)
+
+    def set_slots(self, colors: np.ndarray) -> None:
+        """Overwrite palette entries from a loaded project (capped at 6 rows)."""
+        colors = np.asarray(colors, dtype="f4")
+        n = min(len(colors), len(self.colors))
+        self.colors[:n] = colors[:n, :3]
 
 ID_VERTEX_SHADER = """
 #version 410
@@ -52,6 +72,23 @@ void main() {
 COLOR_TEX_WIDTH = 4096
 
 
+def _index_texture(ctx: moderngl.Context, n_faces: int):
+    """A NEAREST-filtered R8UI texture sized to hold one byte per face."""
+    height = (n_faces + COLOR_TEX_WIDTH - 1) // COLOR_TEX_WIDTH
+    shape = (COLOR_TEX_WIDTH, max(height, 1))
+    tex = ctx.texture(shape, 1, dtype="u1")
+    tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    return tex, shape
+
+
+def _write_index(texture, shape, n_faces: int, values: np.ndarray) -> None:
+    """Pad a per-face byte array to the texture's size and upload it."""
+    w, h = shape
+    padded = np.zeros(w * h, dtype="u1")
+    padded[:n_faces] = values
+    texture.write(padded.tobytes())
+
+
 MAX_UNDO = 100
 
 
@@ -72,10 +109,7 @@ class PaintState:
         # -1 = ikke berørt i aktuel stroke; ellers farven før strokens start
         self._stroke_old = np.full(n_faces, -1, dtype="i2")
 
-        height = (n_faces + COLOR_TEX_WIDTH - 1) // COLOR_TEX_WIDTH
-        self._tex_shape = (COLOR_TEX_WIDTH, max(height, 1))
-        self.texture = ctx.texture(self._tex_shape, 1, dtype="u1")
-        self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.texture, self._tex_shape = _index_texture(ctx, n_faces)
         self._upload()
 
     # --- strokes ----------------------------------------------------------
@@ -107,6 +141,16 @@ class PaintState:
         self.set_faces(np.arange(self.n_faces), 0)
         self.end_stroke()
 
+    def load_colors(self, face_colors: np.ndarray) -> None:
+        """Replace all paint from a loaded project; resets undo/redo history."""
+        n = min(len(face_colors), self.n_faces)
+        self.face_colors[:] = 0
+        self.face_colors[:n] = np.clip(face_colors[:n], 0, Palette.MAX_SLOTS)
+        self._undo.clear()
+        self._redo.clear()
+        self._stroke_old.fill(-1)
+        self._upload()
+
     # --- undo/redo --------------------------------------------------------
     def undo(self) -> None:
         self._swap(self._undo, self._redo)
@@ -123,10 +167,7 @@ class PaintState:
         self._upload()
 
     def _upload(self) -> None:
-        w, h = self._tex_shape
-        padded = np.zeros(w * h, dtype="u1")
-        padded[: self.n_faces] = self.face_colors
-        self.texture.write(padded.tobytes())
+        _write_index(self.texture, self._tex_shape, self.n_faces, self.face_colors)
 
 
 class Picker:
@@ -191,3 +232,34 @@ class Picker:
         hits = np.unique(ids[circle])
         hits = hits[hits > 0].astype("i8") - 1
         return hits
+
+
+class HoverHighlight:
+    """A per-face mask of the region a fill-mode click would paint.
+
+    Uploaded to a NEAREST R8UI texture the fragment shader tints, so the user
+    sees the exact face set before committing. Only re-uploads when the hovered
+    set actually changes, keeping per-cursor-move cost negligible.
+    """
+
+    def __init__(self, ctx: moderngl.Context, n_faces: int):
+        self.ctx = ctx
+        self.n_faces = n_faces
+        self.texture, self._tex_shape = _index_texture(ctx, n_faces)
+        self._mask = np.zeros(n_faces, dtype="u1")
+        self._active = np.empty(0, dtype="i8")
+        self._upload()
+
+    def set(self, face_ids: np.ndarray) -> None:
+        if np.array_equal(face_ids, self._active):
+            return
+        self._mask[self._active] = 0
+        self._mask[face_ids] = 1
+        self._active = face_ids
+        self._upload()
+
+    def clear(self) -> None:
+        self.set(np.empty(0, dtype="i8"))
+
+    def _upload(self) -> None:
+        _write_index(self.texture, self._tex_shape, self.n_faces, self._mask)
