@@ -5,12 +5,16 @@ along the principal axes (PCA) plus global X/Y/Z. Each is scored by reflecting
 all face centroids and counting how many land on an existing face (KD-tree NN).
 
 Painting: there is no exact triangle-to-triangle mirror map on a real mesh — a
-chiral triangulation (e.g. a torus) flips each quad's diagonal under reflection,
-and a sculpted model is only ~98% symmetric — so any per-triangle correspondence
-produces notches, speckles or ragged edges. We mirror PURELY GEOMETRICALLY: the
-brush dab is a small ball of faces; we reflect its centre through the plane and
-paint the faces within the same radius on the far side. Source and mirror use the
-identical rule, so the two sides look the same by construction, on any mesh.
+chiral triangulation flips each quad's diagonal under reflection, and a
+sculpted model is only ~98% symmetric — so any per-triangle correspondence
+decided from a SINGLE sample point (the centroid) is a coin flip for every
+face the reflected boundary cuts through, which renders as sawtooth spikes.
+Instead each candidate face votes with several interior sample points: the
+face is painted iff the MAJORITY of its area, reflected through the plane,
+lands on painted source faces. That is a direct discretization of the only
+well-defined notion of "the mirrored region" on a differently-triangulated
+surface, so the boundary follows the reflected stroke as closely as the
+target triangulation allows.
 """
 
 from __future__ import annotations
@@ -33,17 +37,36 @@ NORMAL_AGREEMENT = 0.8
 # søm-bro: bånd-bredde (i centroid-afstande) og maks. iterationer
 SEAM_BAND = 3.0
 SEAM_ITERS = 6
+# afstemning: indre barycentriske samplepunkter pr. kandidat-face (ulige antal,
+# spredt jævnt over fladen, så stemmeandelen approksimerer areal-andelen)
+VOTE_BARY = np.array(
+    [
+        [1 / 3, 1 / 3, 1 / 3],
+        [2 / 3, 1 / 6, 1 / 6],
+        [1 / 6, 2 / 3, 1 / 6],
+        [1 / 6, 1 / 6, 2 / 3],
+        [1 / 6, 5 / 12, 5 / 12],
+        [5 / 12, 1 / 6, 5 / 12],
+        [5 / 12, 5 / 12, 1 / 6],
+    ]
+)
+# sample-normal skal pege nogenlunde som kandidatens spejlede normal (afslappet
+# ift. detektionens 0.8 pga. krumning hen over en face)
+VOTE_NORMAL_AGREEMENT = 0.5
 
 
 @dataclass
 class MirrorMap:
-    face_map: np.ndarray   # (F,) face på hver faces spejl-position, -1 = ingen
-    adjacency: np.ndarray  # (E,2) face-nabopar, til hul-lukning og søm-bro
-    dside: np.ndarray      # (F,) signeret afstand til planet, pr. face
-    spacing: float         # median centroid-afstand (bånd-skala)
-    normal: np.ndarray     # (3,) planets normal
-    origin: np.ndarray     # (3,) punkt i planet
-    match: float           # andel faces med makker (0..1)
+    face_map: np.ndarray      # (F,) face på hver faces spejl-position, -1 = ingen
+    adjacency: np.ndarray     # (E,2) face-nabopar, til hul-lukning og søm-bro
+    dside: np.ndarray         # (F,) signeret afstand til planet, pr. face
+    spacing: float            # median centroid-afstand (bånd-skala)
+    normal: np.ndarray        # (3,) planets normal
+    origin: np.ndarray        # (3,) punkt i planet
+    match: float              # andel faces med makker (0..1)
+    tri: np.ndarray           # (F,3,3) trekant-hjørner, til sample-afstemning
+    face_normals: np.ndarray  # (F,3) face-normaler
+    tree: cKDTree             # KD-træ over centroider
 
     @property
     def axis_label(self) -> str:
@@ -105,20 +128,60 @@ class MirrorMap:
             painted[bridge] = True
         return np.flatnonzero(painted)
 
-    def mirror(self, face_ids: np.ndarray) -> np.ndarray:
-        """The painted faces plus their mirror, by face correspondence.
+    def _grow(self, mask: np.ndarray, rings: int) -> np.ndarray:
+        """Expand a face mask by N adjacency rings."""
+        a, b = self.adjacency[:, 0], self.adjacency[:, 1]
+        for _ in range(rings):
+            nxt = mask.copy()
+            nxt[b[mask[a]]] = True
+            nxt[a[mask[b]]] = True
+            mask = nxt
+        return mask
 
-        The source stays exactly the brushed faces (no radius ball — a 3D ball
-        engulfs whole tall triangles and spikes the edge). Each painted face is
-        mirrored to the face that sits at its reflected position; a hole-fill
-        closes the speckles that the many-to-one mapping leaves, and a seam
-        bridge connects the two halves across the plane.
+    def mirror(self, face_ids: np.ndarray) -> np.ndarray:
+        """The painted faces plus their area-majority mirror.
+
+        Candidates (the correspondence-mapped faces grown a couple of rings)
+        each cast VOTE_BARY interior sample points; every sample is reflected
+        through the plane and looked up in the source triangulation. A
+        candidate is painted iff the majority of its samples land on painted
+        faces — i.e. the majority of its area lies inside the reflected
+        stroke. The single-sample decision this replaces was a coin flip for
+        every boundary-cut face, which rendered as sawtooth spikes.
         """
         if len(face_ids) == 0:
             return face_ids
+        n = len(self.face_map)
+        painted = np.zeros(n, dtype=bool)
+        painted[face_ids] = True
+
+        # kandidater: korrespondance-billedet begge veje + 2 ringe naboer
+        seedmask = np.zeros(n, dtype=bool)
         forward = self.face_map[face_ids]
-        forward = forward[forward >= 0]
-        result = np.union1d(face_ids, forward)
+        seedmask[forward[forward >= 0]] = True
+        seedmask |= np.isin(self.face_map, face_ids)
+        candidates = np.flatnonzero(self._grow(seedmask, 2) & ~painted)
+        if len(candidates) == 0:
+            return face_ids
+
+        # reflektér kandidaternes samplepunkter og find indeholdende kilde-face
+        samples = np.einsum("bk,fkx->fbx", VOTE_BARY, self.tri[candidates])
+        flat = samples.reshape(-1, 3)
+        refl = flat - 2.0 * (((flat - self.origin) @ self.normal)[:, None] * self.normal)
+        hits, _ = _containing_face(refl, self.tree, self.tri)
+
+        # en sample tæller kun hvis den lander på den rigtige overflade-side
+        mirrored_n = self.face_normals[candidates] - 2.0 * (
+            (self.face_normals[candidates] @ self.normal)[:, None] * self.normal
+        )
+        agree = (
+            np.repeat(mirrored_n, len(VOTE_BARY), axis=0) * self.face_normals[hits]
+        ).sum(axis=1) >= VOTE_NORMAL_AGREEMENT
+
+        votes = (painted[hits] & agree).reshape(len(candidates), -1)
+        accepted = candidates[votes.mean(axis=1) >= 0.5]
+
+        result = np.union1d(face_ids, accepted)
         result = self._fill_holes(result)
         return self._bridge_seam(result)
 
@@ -225,7 +288,8 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     face_map = np.where(ok, idx, -1).astype(np.int64)
 
     best = MirrorMap(
-        face_map, adjacency, dside, spacing, best_n, center, best_match
+        face_map, adjacency, dside, spacing, best_n, center, best_match,
+        tri, normals, tree,
     )
 
     print(
