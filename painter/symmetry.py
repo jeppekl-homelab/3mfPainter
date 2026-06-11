@@ -32,7 +32,7 @@ NORMAL_AGREEMENT = 0.8
 @dataclass
 class MirrorMap:
     face_map: np.ndarray   # (F,) int64; spejl-face pr. face, -1 = ingen makker
-    coquad: np.ndarray     # (F,) int64; co-quad-nabo (længste kant), -1 = ingen
+    adjacency: np.ndarray  # (E,2) int64; face-nabopar, til hul-lukning
     normal: np.ndarray     # (3,) planets normal
     origin: np.ndarray     # (3,) punkt i planet
     match: float           # andel faces med makker (0..1)
@@ -45,56 +45,47 @@ class MirrorMap:
             return names[ax]
         return f"({self.normal[0]:.2f}, {self.normal[1]:.2f}, {self.normal[2]:.2f})"
 
-    def _quad_close(self, face_ids: np.ndarray) -> np.ndarray:
-        """Include each face's co-quad neighbor so a stroke covers whole quads.
+    def _fill_holes(self, faces: np.ndarray) -> np.ndarray:
+        """Fill fully-enclosed single-face gaps (all edge-neighbors painted).
 
-        A grid triangulation splits every quad along a diagonal, and reflection
-        flips that diagonal — so a contiguous run of triangles maps to a ragged
-        set of lone triangles on the mirrored side. Pairing each triangle with
-        its neighbor across the longest shared edge (the diagonal) makes both
-        sides whole quads, which mirror onto whole quads cleanly.
+        The ~few % of faces with no mirror partner can leave a pinhole inside
+        the mirrored region. Filling only faces whose every neighbor is already
+        painted closes those without growing the region's outer boundary, so
+        the result stays the shape of the stroke.
         """
-        mates = self.coquad[face_ids]
-        return np.union1d(face_ids, mates[mates >= 0])
+        adj = self.adjacency
+        if len(adj) == 0 or len(faces) == 0:
+            return faces
+        n = len(self.face_map)
+        painted = np.zeros(n, dtype=bool)
+        painted[faces] = True
+        a, b = adj[:, 0], adj[:, 1]
+        deg = np.bincount(a, minlength=n) + np.bincount(b, minlength=n)
+        pnb = np.bincount(a, painted[b], n) + np.bincount(b, painted[a], n)
+        holes = np.flatnonzero((~painted) & (deg > 0) & (pnb >= deg))
+        if len(holes) == 0:
+            return faces
+        return np.union1d(faces, holes)
 
     def mirror(self, face_ids: np.ndarray) -> np.ndarray:
-        """Union of the faces and their mirror partners.
+        """The painted faces plus their mirror image, as a clean region.
 
-        Strokes are first closed to whole quads (see _quad_close) so the
-        mirrored side has no lone, flipped triangles. The map is then used in
-        both directions: forward (the painted face's partner) AND inverse
-        (every face whose own reflection lands in the painted set). Forward
-        alone is not surjective — faces on the mirrored side that are nobody's
-        nearest neighbor would be skipped, leaving unpainted speckles.
+        Uses the map in the INVERSE direction: a target face is mirrored-in
+        when its own reflection lands on a painted face. Evaluating it per
+        target face fills the reflected region completely (no speckle holes)
+        and — unlike the forward direction — never drags in a lone outlier
+        triangle whose partner sits just outside the painted set. A final
+        hole-fill closes the rare pinholes left by partnerless faces.
         """
-        src = self._quad_close(face_ids)
-        forward = self.face_map[src]
-        forward = forward[forward >= 0]
-        inverse = np.flatnonzero(np.isin(self.face_map, src))
-        return np.union1d(np.union1d(src, forward), inverse)
+        inverse = np.flatnonzero(np.isin(self.face_map, face_ids))
+        result = np.union1d(face_ids, inverse)
+        return self._fill_holes(result)
 
 
-def _coquad_map(mesh: PaintMesh) -> np.ndarray:
-    """For each face, the neighbor across its longest shared edge (the diagonal).
-
-    Vectorized: both directions of every adjacency are sorted by shared-edge
-    length so the longest edge wins per face. Boundary faces stay -1.
-    """
+def _face_adjacency(mesh: PaintMesh) -> np.ndarray:
+    """(E, 2) array of neighboring face-id pairs (shared-edge adjacency)."""
     tm = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
-    adj = np.asarray(tm.face_adjacency)
-    edges = np.asarray(tm.face_adjacency_edges)
-    coquad = np.full(mesh.n_faces, -1, dtype=np.int64)
-    if len(adj) == 0:
-        return coquad
-    length = np.linalg.norm(
-        mesh.vertices[edges[:, 0]] - mesh.vertices[edges[:, 1]], axis=1
-    )
-    src = np.concatenate([adj[:, 0], adj[:, 1]])
-    dst = np.concatenate([adj[:, 1], adj[:, 0]])
-    length = np.concatenate([length, length])
-    order = np.argsort(length, kind="stable")  # stigende → længste kant vinder
-    coquad[src[order]] = dst[order]
-    return coquad
+    return np.asarray(tm.face_adjacency, dtype=np.int64)
 
 
 def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
@@ -120,7 +111,7 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     tree = cKDTree(centroids)
     face_scale = np.sqrt(np.maximum(areas, 1e-12))
     normals = cross / np.maximum(np.linalg.norm(cross, axis=1, keepdims=True), 1e-12)
-    coquad = _coquad_map(mesh)
+    adjacency = _face_adjacency(mesh)
 
     best: MirrorMap | None = None
     for n in unique:
@@ -133,7 +124,7 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
         match = float(ok.mean())
         if match >= ACCEPT_FRACTION and (best is None or match > best.match):
             face_map = np.where(ok, idx, -1).astype(np.int64)
-            best = MirrorMap(face_map, coquad, n.copy(), center, match)
+            best = MirrorMap(face_map, adjacency, n.copy(), center, match)
 
     elapsed = time.perf_counter() - t0
     if best is None:
