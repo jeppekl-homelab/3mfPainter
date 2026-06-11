@@ -1,11 +1,16 @@
-"""Mirror-symmetry detection.
+"""Mirror-symmetry detection and mirrored painting.
 
-Strategy: candidate mirror planes pass through the area-weighted centroid with
-normals along the principal axes (PCA) plus the global X/Y/Z axes. Each
-candidate is scored by reflecting all face centroids through the plane and
-measuring how many land on top of an existing face (KD-tree nearest neighbor,
-O(n log n)). The best plane above the acceptance threshold yields a per-face
-mirror map used to mirror paint strokes.
+Detection: candidate planes pass through the area-weighted centroid with normals
+along the principal axes (PCA) plus global X/Y/Z. Each is scored by reflecting
+all face centroids and counting how many land on an existing face (KD-tree NN).
+
+Painting: a chiral triangulation (e.g. a torus, where each quad's splitting
+diagonal flips under reflection) admits NO exact triangle-to-triangle mirror
+map — any per-triangle correspondence leaves notches or speckle holes. So we
+mirror geometrically instead: reflect the painted faces' centroids and paint
+every face whose reflection lands within a local radius of a painted one. This
+is a solid area fill — no correspondence, no chirality assumption, so it cannot
+speckle, and on real (irregular) meshes the two sides come out symmetric.
 """
 
 from __future__ import annotations
@@ -21,19 +26,20 @@ from .mesh import PaintMesh
 
 # andel af faces der skal have en spejl-makker før planet accepteres
 ACCEPT_FRACTION = 0.85
-# NN-tolerance i enheder af makker-facens egen størrelse (sqrt af areal).
-# Trianguleringen er aldrig spejlsymmetrisk i praksis, så den reflekterede
-# centroid lander et tilfældigt sted på den spejlede face — ikke i dens centroid.
+# NN-tolerance i enheder af makker-facens egen størrelse (sqrt af areal)
 TOLERANCE_FACE_SCALE = 1.0
 # spejlet normal skal pege samme vej som makkerens normal
 NORMAL_AGREEMENT = 0.8
-# maks. iterationer i den symmetriske lukning (konvergerer typisk på 3-6)
-MIRROR_CLOSURE_ITERS = 16
+# splat-radius i enheder af en faces lokale centroid-afstand (fylder huller
+# uden at overmale; >1 sikrer solidt fyld på tværs af triangulerings-skift)
+MIRROR_RADIUS_SCALE = 1.3
 
 
 @dataclass
 class MirrorMap:
-    face_map: np.ndarray   # (F,) int64; spejl-face pr. face, -1 = ingen makker
+    centroids: np.ndarray  # (F,3) face-centroider
+    reflected: np.ndarray  # (F,3) centroider spejlet i planet
+    radius: np.ndarray     # (F,) splat-radius pr. face (lokal centroid-afstand)
     adjacency: np.ndarray  # (E,2) int64; face-nabopar, til hul-lukning
     normal: np.ndarray     # (3,) planets normal
     origin: np.ndarray     # (3,) punkt i planet
@@ -48,17 +54,11 @@ class MirrorMap:
         return f"({self.normal[0]:.2f}, {self.normal[1]:.2f}, {self.normal[2]:.2f})"
 
     def _fill_holes(self, faces: np.ndarray) -> np.ndarray:
-        """Fill fully-enclosed single-face gaps (all edge-neighbors painted).
-
-        The ~few % of faces with no mirror partner can leave a pinhole inside
-        the mirrored region. Filling only faces whose every neighbor is already
-        painted closes those without growing the region's outer boundary, so
-        the result stays the shape of the stroke.
-        """
+        """Fill fully-enclosed single-face gaps (all edge-neighbors painted)."""
         adj = self.adjacency
         if len(adj) == 0 or len(faces) == 0:
             return faces
-        n = len(self.face_map)
+        n = len(self.radius)
         painted = np.zeros(n, dtype=bool)
         painted[faces] = True
         a, b = adj[:, 0], adj[:, 1]
@@ -70,80 +70,26 @@ class MirrorMap:
         return np.union1d(faces, holes)
 
     def mirror(self, face_ids: np.ndarray) -> np.ndarray:
-        """Paint the faces and their mirror image as a symmetric, gap-free region.
+        """The painted faces plus a solid mirror image across the plane.
 
-        A chiral triangulation (e.g. a torus) has no exact triangle-level mirror
-        involution: the diagonal that splits each quad flips under reflection, so
-        any single-pass mapping leaves a one-triangle notch on one side. We close
-        the set under the partner map in BOTH directions until it stops growing —
-        forward (each face's partner) and inverse (each face whose partner is in
-        the set). The fixed point is area-symmetric: the two sides end up exactly
-        balanced with no notch and no speckle holes, at the cost of a slight but
-        symmetric thickening of the stroke. A final hole-fill is a cheap belt-and-
-        suspenders against any remaining enclosed pinhole.
+        A face is mirrored-in when ITS reflection lands within the face's local
+        radius of a painted face's centroid. Evaluated per face, this fills the
+        reflected region solidly regardless of how the two sides are triangulated
+        — the cause of the notches and speckles that any triangle-correspondence
+        map produces on chiral or imperfectly-symmetric meshes.
         """
-        result = np.unique(face_ids)
-        for _ in range(MIRROR_CLOSURE_ITERS):
-            partners = self.face_map[result]
-            partners = partners[partners >= 0]
-            inverse = np.flatnonzero(np.isin(self.face_map, result))
-            grown = np.union1d(np.union1d(result, partners), inverse)
-            if len(grown) == len(result):
-                break
-            result = grown
-        return self._fill_holes(result)
+        if len(face_ids) == 0:
+            return face_ids
+        dab = cKDTree(self.centroids[face_ids])
+        dist, _ = dab.query(self.reflected, workers=-1)
+        mirrored = np.flatnonzero(dist <= self.radius)
+        return self._fill_holes(np.union1d(face_ids, mirrored))
 
 
 def _face_adjacency(mesh: PaintMesh) -> np.ndarray:
     """(E, 2) array of neighboring face-id pairs (shared-edge adjacency)."""
     tm = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
     return np.asarray(tm.face_adjacency, dtype=np.int64)
-
-
-def _containing_face(
-    points: np.ndarray, tree: cKDTree, tri: np.ndarray, k: int = 8
-) -> tuple[np.ndarray, np.ndarray]:
-    """For each point, the triangle that contains it (projected), and its distance.
-
-    Nearest-centroid matching fails near a quad's diagonal: the reflected point
-    lands inside one triangle, but the other triangle's centroid may be closer,
-    so contiguous regions mirror to ragged ones. Instead, among the k nearest
-    centroids, test which triangle actually contains the point (barycentric,
-    projected onto the triangle plane) and pick the one it sits closest to the
-    plane of. Faces that contain no candidate fall back to the nearest centroid.
-    """
-    k = min(k, tri.shape[0])
-    _, idx = tree.query(points, k=k, workers=-1)
-    if idx.ndim == 1:
-        idx = idx[:, None]
-    a, b, c = tri[idx, 0], tri[idx, 1], tri[idx, 2]      # (N, k, 3)
-    p = points[:, None, :]
-    v0, v1, v2 = b - a, c - a, p - a
-    d00 = (v0 * v0).sum(-1)
-    d01 = (v0 * v1).sum(-1)
-    d11 = (v1 * v1).sum(-1)
-    d20 = (v2 * v0).sum(-1)
-    d21 = (v2 * v1).sum(-1)
-    denom = d00 * d11 - d01 * d01
-    denom = np.where(np.abs(denom) < 1e-20, 1e-20, denom)
-    v = (d11 * d20 - d01 * d21) / denom
-    w = (d00 * d21 - d01 * d20) / denom
-    u = 1.0 - v - w
-    eps = 1e-6
-    inside = (u >= -eps) & (v >= -eps) & (w >= -eps)     # (N, k)
-    nf = np.cross(v0, v1)
-    nf /= np.maximum(np.linalg.norm(nf, axis=-1, keepdims=True), 1e-12)
-    perp = np.abs((v2 * nf).sum(-1))                     # afstand til trekantplanet
-    score = np.where(inside, perp, np.inf)
-    best = np.argmin(score, axis=1)
-    rows = np.arange(len(points))
-    chosen = idx[rows, best].copy()
-    dist = score[rows, best].copy()
-    # punkter uden nogen indeholdende kandidat: fald tilbage til nærmeste centroid
-    none = ~inside.any(axis=1)
-    chosen[none] = idx[none, 0]
-    dist[none] = np.linalg.norm(points[none] - tri[idx[none, 0]].mean(1), axis=1)
-    return chosen, dist
 
 
 def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
@@ -171,7 +117,7 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     normals = cross / np.maximum(np.linalg.norm(cross, axis=1, keepdims=True), 1e-12)
     adjacency = _face_adjacency(mesh)
 
-    # 1) hurtig scoring med centroid-NN for at vælge det bedste kandidatplan
+    # vælg det bedste kandidatplan via centroid-NN-scoring
     best_n: np.ndarray | None = None
     best_match = 0.0
     for n in unique:
@@ -189,16 +135,11 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
         print(f"Symmetri: intet spejlplan fundet ({elapsed:.2f}s)")
         return None
 
-    # 2) nøjagtig partner pr. face for det valgte plan: hvilken trekant INDEHOLDER
-    #    det spejlede punkt (ikke blot nærmeste centroid) — fjerner hakkede kanter
+    # forbered geometrisk spejling: reflekterede centroider + lokal splat-radius
     reflected = centroids - 2.0 * ((d @ best_n)[:, None] * best_n)
-    tri = mesh.vertices[mesh.faces]
-    idx, sdist = _containing_face(reflected, tree, tri)
-    mirrored_n = normals - 2.0 * ((normals @ best_n)[:, None] * best_n)
-    normal_ok = (mirrored_n * normals[idx]).sum(axis=1) >= NORMAL_AGREEMENT
-    ok = (sdist <= TOLERANCE_FACE_SCALE * face_scale[idx]) & normal_ok
-    face_map = np.where(ok, idx, -1).astype(np.int64)
-    best = MirrorMap(face_map, adjacency, best_n, center, best_match)
+    nn_dist, _ = tree.query(centroids, k=2, workers=-1)   # [:,1] = nærmeste nabo
+    radius = MIRROR_RADIUS_SCALE * nn_dist[:, 1]
+    best = MirrorMap(centroids, reflected, radius, adjacency, best_n, center, best_match)
 
     print(
         f"Symmetri: spejlplan {best.axis_label}, "
