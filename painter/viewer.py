@@ -199,6 +199,31 @@ class Viewer:
             self._plane_vbo.release()
             self._plane_vao = None
 
+    def subdivide(self) -> None:
+        """Flat midpoint subdivision: every face -> 4, geometry unchanged.
+
+        Paint resolution is the whole point: painting works in whole faces, so
+        on coarse meshes a click-dab is a clump of 3-7 big triangles and its
+        mirror discretizes differently. Smaller faces shrink that quantization
+        error everywhere. Children inherit their parent's color; the camera is
+        preserved; undo history resets (face indices change meaning).
+        """
+        import trimesh.remesh
+
+        new_v, new_f, index = trimesh.remesh.subdivide(
+            self.mesh.vertices, self.mesh.faces, return_index=True
+        )
+        colors = self.paint.face_colors
+        # index: dict {forælder-face: array af nye faces} -> parent pr. ny face
+        parent = np.empty(len(new_f), dtype=np.int64)
+        children = np.array(list(index.values()), dtype=np.int64)   # (F, 4)
+        parent[children] = np.fromiter(index.keys(), dtype=np.int64)[:, None]
+        camera = self.camera
+        self.set_mesh(mesh_io.build(new_v, new_f))
+        self.camera = camera
+        self.paint.load_colors(colors[parent])
+        print(f"Subdivision: {len(colors):,} -> {self.mesh.n_faces:,} faces")
+
     # --- input callbacks ---------------------------------------------------
     def _on_mouse_button(self, window, button, action, mods):
         if imgui.get_io().want_capture_mouse:
@@ -484,6 +509,18 @@ class Viewer:
         _, self.brush_radius = imgui.slider_int(
             "Brush size", self.brush_radius, 2, 200, "%d px"
         )
+        imgui.separator()
+
+        imgui.text(f"Mesh: {self.mesh.n_faces:,} faces")
+        imgui.same_line()
+        if imgui.small_button("Subdivide x4"):
+            self.subdivide()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(
+                "Split every face into 4 (geometry unchanged).\n"
+                "Finer paint resolution: dabs and their mirror\n"
+                "converge to the same shape. Resets undo."
+            )
         imgui.separator()
 
         changed, self.mirror_mode = imgui.checkbox("Mirror (M)", self.mirror_mode)

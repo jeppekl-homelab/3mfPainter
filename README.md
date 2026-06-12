@@ -20,6 +20,7 @@ Uden argument vises en demo-torus.
 | Venstre træk | **Mal** med aktuel farve (pensel) eller **fyld region** (fill mode) |
 | F | Skift mellem pensel og fill mode |
 | M | Mirror mode: maling spejles over modellens symmetriplan |
+| Subdivide x4 (knap) | Del alle faces i 4 (geometri uændret) — finere malings-opløsning |
 | Højre træk | Rotér |
 | Shift+træk / midterknap | Panorér |
 | Scroll | Zoom |

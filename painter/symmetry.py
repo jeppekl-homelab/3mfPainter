@@ -31,8 +31,14 @@ from .mesh import PaintMesh
 ACCEPT_FRACTION = 0.85
 # NN-tolerance i enheder af makker-facens egen størrelse (sqrt af areal)
 TOLERANCE_FACE_SCALE = 1.0
+# absolut tolerance-bund som andel af modellens radius: en sculpted models
+# asymmetri er en geometrisk størrelse, uafhængig af hvor fint den er
+# trianguleret — uden bunden fejler detektionen på subdividerede meshes
+TOLERANCE_MIN_RADIUS = 0.004
 # spejlet normal skal pege samme vej som makkerens normal
 NORMAL_AGREEMENT = 0.8
+# detektionen scorer på højst så mange faces (statistisk nok, holder den hurtig)
+MAX_SCORING_FACES = 60_000
 
 
 @dataclass
@@ -82,17 +88,27 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
         if not any(abs(n @ u) > 0.99 for u in unique):
             unique.append(n)
 
+    # subsample scoringen på store meshes — match-andelen er statistisk og
+    # kræver ikke alle faces, men KD-træet over målsiden bruger dem alle
+    if len(centroids) > MAX_SCORING_FACES:
+        rng = np.random.default_rng(0)
+        sample = rng.choice(len(centroids), MAX_SCORING_FACES, replace=False)
+    else:
+        sample = np.arange(len(centroids))
+
     tree = cKDTree(centroids)
     face_scale = np.sqrt(np.maximum(areas, 1e-12))
     normals = cross / np.maximum(np.linalg.norm(cross, axis=1, keepdims=True), 1e-12)
+    tol_min = TOLERANCE_MIN_RADIUS * mesh.radius
 
     best: MirrorMap | None = None
     for n in unique:
-        reflected = centroids - 2.0 * ((d @ n)[:, None] * n)
+        reflected = centroids[sample] - 2.0 * ((d[sample] @ n)[:, None] * n)
         dist, idx = tree.query(reflected, workers=-1)
-        mirrored_n = normals - 2.0 * ((normals @ n)[:, None] * n)
+        mirrored_n = normals[sample] - 2.0 * ((normals[sample] @ n)[:, None] * n)
         normal_ok = (mirrored_n * normals[idx]).sum(axis=1) >= NORMAL_AGREEMENT
-        ok = (dist <= TOLERANCE_FACE_SCALE * face_scale[idx]) & normal_ok
+        tol = np.maximum(TOLERANCE_FACE_SCALE * face_scale[idx], tol_min)
+        ok = (dist <= tol) & normal_ok
         match = float(ok.mean())
         if match >= ACCEPT_FRACTION and (best is None or match > best.match):
             best = MirrorMap(n.copy(), center, match)
