@@ -290,16 +290,36 @@ class Viewer:
             return
         scale = h / wh  # DPI-skalering: window-koordinater -> framebuffer-pixels
         radius = 2 if self.fill_mode else int(self.brush_radius * scale)
-        face_ids = self.picker.pick(
-            self._mvp_bytes, (w, h), (x * scale, y * scale), radius
-        )
+        face_ids = self._dab((w, h), (x * scale, y * scale), radius)
+        self.paint.set_faces(face_ids, self.current_color)
+
+    def _dab(
+        self, fb_size: tuple[int, int], cursor: tuple[float, float], radius: int
+    ) -> np.ndarray:
+        """One brush dab: pick (+ segment expand) and, in mirror mode, the
+        IDENTICAL pick through the plane-reflected camera. Mirroring the brush
+        instead of the painted faces gives both sides the same first-order
+        discretization of the dab — no correspondence, no sawtooth."""
+        face_ids = self.picker.pick(self._mvp_bytes, fb_size, cursor, radius)
         if self.fill_mode:
             face_ids = self._expand_to_segments(face_ids)
-        if self.mirror_mode and len(face_ids):
+        if self.mirror_mode:
             mirror = self._get_mirror()
             if mirror is not None:
-                face_ids = mirror.mirror(face_ids)
-        self.paint.set_faces(face_ids, self.current_color)
+                mids = self.picker.pick(
+                    self._mirrored_mvp_bytes(mirror), fb_size, cursor, radius,
+                    flip_winding=True,
+                )
+                if self.fill_mode:
+                    mids = self._expand_to_segments(mids)
+                face_ids = np.union1d(face_ids, mids)
+        return face_ids
+
+    def _mirrored_mvp_bytes(self, mirror: MirrorMap) -> bytes:
+        """MVP composed with the world-space reflection (column-major bytes)."""
+        m = np.frombuffer(self._mvp_bytes, dtype="f4").reshape(4, 4, order="F")
+        mr = m.astype("f8") @ mirror.reflection_matrix()
+        return mr.astype("f4").T.tobytes()
 
     def _hover_at(self, x: float, y: float) -> None:
         """Highlight the region a fill-mode click would paint (incl. mirror)."""
@@ -308,12 +328,7 @@ class Viewer:
         if h == 0 or wh == 0:
             return
         scale = h / wh
-        face_ids = self.picker.pick(self._mvp_bytes, (w, h), (x * scale, y * scale), 2)
-        face_ids = self._expand_to_segments(face_ids)
-        if self.mirror_mode and len(face_ids):
-            mirror = self._get_mirror()
-            if mirror is not None:
-                face_ids = mirror.mirror(face_ids)
+        face_ids = self._dab((w, h), (x * scale, y * scale), 2)
         self.hover.set(face_ids)
 
     def _get_mirror(self) -> MirrorMap | None:

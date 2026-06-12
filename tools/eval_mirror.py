@@ -1,12 +1,17 @@
-"""Quantitative evaluation of mirrored-painting quality.
+"""Mirrored-painting quality harness (run from repo root).
 
-Builds a coarse capsule (tall thin side triangles, like the bug screenshot),
-paints a ball-shaped patch on one side of the mirror plane, mirrors it, and
-compares against a ground truth computed by dense area sampling: a face on the
-far side SHOULD be painted iff >=50% of its area, reflected through the plane,
-lands on painted source faces.
+Drives the REAL app paint path offscreen: Picker ID-buffer picks along a
+simulated mouse stroke beside the symmetry plane, with the mirrored pick
+(reflected camera, flipped winding) — exactly what the viewer does in mirror
+mode. Quality metric: the mirrored patch should have the same boundary
+complexity (adjacency edges crossing the patch border) as the source patch.
+Correspondence-based mirroring inflated it 25-100%; brush mirroring keeps
+them equal by construction.
 
-Outputs the symmetric difference vs ground truth and a render of the result.
+Usage:
+    python tools/eval_mirror.py [path/to/model.stl] [out.png]
+Defaults to the chiral worst case: a stretched uv-sphere where reflection
+flips every quad diagonal.
 """
 
 import sys
@@ -16,148 +21,124 @@ import moderngl
 import glm
 import trimesh
 from PIL import Image
-from scipy.spatial import cKDTree
 
-from painter.mesh import _prepare
-from painter import symmetry
-from painter.symmetry import find_mirror, _containing_face
-from painter.viewer import mat_bytes
+sys.path.insert(0, ".")
 
-TAG = sys.argv[1] if len(sys.argv) > 1 else "old"
+from painter import mesh as mesh_io                       # noqa: E402
+from painter.camera import OrbitCamera                    # noqa: E402
+from painter.mesh import _prepare                         # noqa: E402
+from painter.painting import Palette, PaintState, Picker  # noqa: E402
+from painter.symmetry import find_mirror                  # noqa: E402
+from painter.viewer import (                              # noqa: E402
+    VERTEX_SHADER, FRAGMENT_SHADER, mat_bytes,
+)
 
-
-def dense_bary(n: int = 9) -> np.ndarray:
-    """Interior barycentric grid points (i+j+k = n, all >= 1)."""
-    pts = [
-        (i / n, j / n, (n - i - j) / n)
-        for i in range(1, n)
-        for j in range(1, n - i)
-    ]
-    return np.array(pts)
+W, H = 1100, 850
 
 
-def ground_truth(mesh, mm, painted_mask):
-    """Faces whose reflected area majority-overlaps the painted set."""
-    tri = mesh.vertices[mesh.faces]                     # (F,3,3)
-    bary = dense_bary(9)                                # (B,3)
-    samples = np.einsum("bk,fkx->fbx", bary, tri)       # (F,B,3)
-    flat = samples.reshape(-1, 3)
-    refl = flat - 2.0 * (((flat - mm.origin) @ mm.normal)[:, None] * mm.normal)
-
-    centroids = tri.mean(axis=1)
-    tree = cKDTree(centroids)
-    hits, _ = _containing_face(refl, tree, tri)
-    votes = painted_mask[hits].reshape(len(tri), -1).mean(axis=1)
-    return votes >= 0.5
+def boundary_edges(mesh, member_mask) -> int:
+    tm = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
+    adj = np.asarray(tm.face_adjacency)
+    return int((member_mask[adj[:, 0]] != member_mask[adj[:, 1]]).sum())
 
 
-def boundary_len(mesh, member_mask, adjacency):
-    """Number of adjacency edges crossing the set boundary (raggedness proxy)."""
-    a, b = adjacency[:, 0], adjacency[:, 1]
-    return int((member_mask[a] != member_mask[b]).sum())
+def main() -> None:
+    if len(sys.argv) > 1:
+        mesh = mesh_io.load(sys.argv[1])
+    else:
+        ell = trimesh.creation.uv_sphere(radius=1.0, count=[48, 40])
+        ell.apply_scale([20.0, 20.0, 40.0])
+        mesh = _prepare(ell)
+    out = sys.argv[2] if len(sys.argv) > 2 else "eval_mirror.png"
 
-
-def render(mesh, colors_u1, path, eye, target):
     ctx = moderngl.create_context(standalone=True, require=410)
     ctx.enable(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
-    prog = ctx.program(
-        vertex_shader="""
-            #version 410
-            uniform mat4 u_mvp;
-            in vec3 in_position; in vec3 in_normal; in vec3 in_color;
-            out vec3 v_n; out vec3 v_c;
-            void main(){ gl_Position=u_mvp*vec4(in_position,1.0); v_n=in_normal; v_c=in_color; }
-        """,
-        fragment_shader="""
-            #version 410
-            uniform vec3 u_eye_dir;
-            in vec3 v_n; in vec3 v_c; out vec4 f;
-            void main(){
-                float d = max(dot(normalize(v_n), u_eye_dir), 0.0)*0.8+0.2;
-                f = vec4(v_c*d, 1.0);
-            }
-        """,
+    prog = ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
+    vbo = ctx.buffer(
+        np.hstack(
+            [mesh.positions, mesh.normals, mesh.face_ids.reshape(-1, 1).view("f4")]
+        ).astype("f4").tobytes()
     )
-    palette = np.array(
-        [[0.8, 0.8, 0.85], [0.9, 0.15, 0.15], [0.2, 0.8, 0.3], [0.2, 0.4, 1.0]], dtype="f4"
+    vao = ctx.vertex_array(
+        prog, [(vbo, "3f 3f 1u", "in_position", "in_normal", "in_face_id")]
     )
-    vcols = np.repeat(palette[colors_u1], 3, axis=0)
-    data = np.hstack([mesh.positions, mesh.normals, vcols]).astype("f4")
-    vbo = ctx.buffer(data.tobytes())
-    vao = ctx.vertex_array(prog, [(vbo, "3f 3f 3f", "in_position", "in_normal", "in_color")])
-    W, H = 900, 700
-    fbo = ctx.framebuffer(ctx.texture((W, H), 4), ctx.depth_renderbuffer((W, H)))
-    fbo.use()
-    ctx.clear(0.12, 0.13, 0.15)
-    view = glm.lookAt(glm.vec3(*eye), glm.vec3(*target), glm.vec3(0, 0, 1))
-    proj = glm.perspective(glm.radians(40), W / H, 0.1, 100.0)
-    prog["u_mvp"].write(mat_bytes(proj * view))
-    d = glm.normalize(glm.vec3(*eye) - glm.vec3(*target))
-    prog["u_eye_dir"].value = (d.x, d.y, d.z)
-    vao.render(moderngl.TRIANGLES)
-    img = Image.frombytes("RGBA", (W, H), fbo.read(components=4)).transpose(
-        Image.FLIP_TOP_BOTTOM
-    )
-    img.save(path)
+    paint = PaintState(ctx, mesh.n_faces)
+    picker = Picker(ctx, vbo)
+    mirror = find_mirror(mesh)
+    assert mirror is not None, "modellen skal have et spejlplan"
 
+    camera = OrbitCamera(mesh.center, mesh.radius)
+    mvp = camera.proj_matrix(W / H) * camera.view_matrix()
+    mvp_bytes = mat_bytes(mvp)
+    m_np = np.frombuffer(mvp_bytes, dtype="f4").reshape(4, 4, order="F").astype("f8")
+    mir_bytes = (m_np @ mirror.reflection_matrix()).astype("f4").T.tobytes()
 
-def main():
-    # kapsel: lav opløsning -> høje tynde trekanter på siderne, som i bug-billedet
-    # strakt uv-kugle: kvadratgitter med ensrettede diagonaler — reflektionen
-    # flipper hver diagonal, så det er værst tænkelige tilfælde for spejling
-    cap = trimesh.creation.uv_sphere(radius=1.0, count=[48, 40])
-    cap.apply_scale([1.0, 1.0, 2.0])
-    mesh = _prepare(cap)
-    mm = find_mirror(mesh)
-    assert mm is not None, "kapsel skal have symmetri"
-    print(f"mesh: {mesh.n_faces} faces; plan: {mm.axis_label}, origin {np.round(mm.origin, 3)}")
+    def project(p3):
+        clip = mvp * glm.vec4(*p3.tolist(), 1.0)
+        return ((clip.x / clip.w + 1) / 2 * W, (1 - (clip.y / clip.w + 1) / 2) * H)
 
-    tri = mesh.vertices[mesh.faces]
-    centroids = tri.mean(axis=1)
+    # strøg parallelt med planet, en anelse til den ene side, på den del af
+    # overfladen der vender mod kameraet
+    n, o = mirror.normal, mirror.origin
+    cam = np.array(list(camera.position()), dtype="f8")
+    view_dir = cam - o
+    view_dir -= (view_dir @ n) * n
+    if np.linalg.norm(view_dir) < 1e-6:
+        view_dir = np.array([1.0, 0, 0])
+    view_dir /= np.linalg.norm(view_dir)
+    axis = np.cross(n, view_dir)
 
-    # "pensel-dab": klat på den ene side af planet, tæt på planet
-    side = (centroids - mm.origin) @ mm.normal
-    perp = np.array([1.0, 0, 0]) if abs(mm.normal[0]) < 0.9 else np.array([0, 1.0, 0])
-    perp = perp - (perp @ mm.normal) * mm.normal
-    perp /= np.linalg.norm(perp)
-    # pensel-agtig dab: enhver face der RØRER cirklen males (som ID-buffer-
-    # picking), dvs. min-afstand over hjørner+centroid — giver samme slags
-    # flossede kildekant som den rigtige pensel på tynde trekanter
-    seed = mm.origin + perp * 1.05 + mm.normal * 0.45
-    pts = np.concatenate([tri, centroids[:, None, :]], axis=1)   # (F,4,3)
-    dmin = np.linalg.norm(pts - seed, axis=2).min(axis=1)
-    src = np.flatnonzero((dmin < 0.55) & (side > 0.02))
-    print(f"kilde-patch: {len(src)} faces")
+    r_model = mesh.radius
+    src_total = np.zeros(mesh.n_faces, dtype=bool)
+    mir_total = np.zeros(mesh.n_faces, dtype=bool)
+    for t in np.linspace(-0.35, 0.35, 16):
+        p = o + (view_dir * 0.85 + n * 0.45 + axis * t) * r_model * 0.7
+        sx, sy = project(p)
+        s_ids = picker.pick(mvp_bytes, (W, H), (sx, sy), 22)
+        m_ids = picker.pick(mir_bytes, (W, H), (sx, sy), 22, flip_winding=True)
+        src_total[s_ids] = True
+        mir_total[m_ids] = True
+        paint.set_faces(np.union1d(s_ids, m_ids), 1)
 
-    painted = np.zeros(mesh.n_faces, dtype=bool)
-    painted[src] = True
-
-    result = mm.mirror(src)
-    res_mask = np.zeros(mesh.n_faces, dtype=bool)
-    res_mask[result] = True
-
-    gt_far = ground_truth(mesh, mm, painted)        # ideal spejlside
-    far = ~painted                                   # alt uden for kilden
-    ideal = painted | (gt_far & far)
-
-    diff = res_mask != ideal
-    print(f"resultat: {res_mask.sum()} faces, ideal: {ideal.sum()}")
-    print(f"symmetrisk difference vs ideal: {diff.sum()} faces")
+    only_mir = mir_total & ~src_total
+    b_src = boundary_edges(mesh, src_total)
+    b_mir = boundary_edges(mesh, only_mir)
+    print(f"kilde: {src_total.sum()} faces, boundary {b_src} kanter")
+    print(f"spejl: {only_mir.sum()} faces, boundary {b_mir} kanter")
+    ratio = b_mir / max(b_src, 1)
     print(
-        f"boundary-kanter resultat: {boundary_len(mesh, res_mask, mm.adjacency)}, "
-        f"ideal: {boundary_len(mesh, ideal, mm.adjacency)}"
+        f"raggedness-ratio (spejl/kilde): {ratio:.2f}  "
+        "(1.0 = perfekt; korrespondance-metoderne lå på 1.3-2.0)"
     )
 
-    # farver: rød = kilde, grøn = spejlet, blå = afvigelse fra ideal
-    cols = np.zeros(mesh.n_faces, dtype="i8")
-    cols[result] = 2
-    cols[src] = 1
-    cols[diff] = 3
-
-    seed_r = seed - 2 * ((seed - mm.origin) @ mm.normal) * mm.normal
-    eye = seed_r * 1.2 + np.array([0, 0, 0.4]) + (seed_r - mm.origin) * 2.2
-    render(mesh, cols, f"eval_mirror_{TAG}.png", eye[:3], seed_r[:3])
-    print(f"gemt eval_mirror_{TAG}.png")
+    # render fra begge sider af planet, så kilde- og spejlstrøg kan sammenlignes
+    fbo = ctx.framebuffer(ctx.texture((W, H), 4), ctx.depth_renderbuffer((W, H)))
+    views = []
+    import math
+    for dyaw in (0.0, math.pi):
+        camera.yaw += dyaw
+        view_mvp = camera.proj_matrix(W / H) * camera.view_matrix()
+        camera.yaw -= dyaw
+        fbo.use()
+        ctx.enable_only(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+        ctx.clear(0.12, 0.13, 0.15)
+        prog["u_mvp"].write(mat_bytes(view_mvp))
+        prog["u_model"].write(mat_bytes(glm.mat4(1.0)))
+        prog["u_camera_pos"].value = tuple(camera.position())
+        prog["u_palette"].write(Palette().colors.tobytes())
+        paint.texture.use(location=0)
+        prog["u_face_colors"].value = 0
+        vao.render(moderngl.TRIANGLES)
+        views.append(
+            Image.frombytes("RGBA", (W, H), fbo.read(components=4)).transpose(
+                Image.FLIP_TOP_BOTTOM
+            )
+        )
+    combo = Image.new("RGBA", (W * 2, H))
+    combo.paste(views[0], (0, 0))
+    combo.paste(views[1], (W, 0))
+    combo.save(out)
+    print(f"gemt {out} (venstre: kilde-side, højre: spejl-side)")
 
 
 if __name__ == "__main__":

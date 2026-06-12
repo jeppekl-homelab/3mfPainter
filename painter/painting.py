@@ -201,16 +201,23 @@ class Picker:
         fb_size: tuple[int, int],
         cursor: tuple[float, float],
         radius_px: int,
+        flip_winding: bool = False,
     ) -> np.ndarray:
-        """Render ID-pass and return unique face ids inside the brush circle."""
+        """Render ID-pass and return unique face ids inside the brush circle.
+
+        flip_winding: brug ved spejlet MVP — en reflektion vender trekanternes
+        omløbsretning, så culling skal vendes for at se de rigtige forsider.
+        """
         w, h = fb_size
         fbo = self._ensure_fbo(fb_size)
         fbo.use()
         # depth test kan være slået fra af ImGui-backenden — håndhæv den
         self.ctx.enable_only(moderngl.DEPTH_TEST | moderngl.CULL_FACE)
+        self.ctx.cull_face = "front" if flip_winding else "back"
         self.ctx.clear()
         self.prog["u_mvp"].write(mvp_bytes)
         self.vao.render(moderngl.TRIANGLES)
+        self.ctx.cull_face = "back"
 
         cx, cy = int(cursor[0]), int(cursor[1])
         r = radius_px

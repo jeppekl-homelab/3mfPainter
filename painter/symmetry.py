@@ -1,20 +1,20 @@
-"""Mirror-symmetry detection and mirrored painting.
+"""Mirror-symmetry detection.
 
-Detection: candidate planes pass through the area-weighted centroid with normals
-along the principal axes (PCA) plus global X/Y/Z. Each is scored by reflecting
-all face centroids and counting how many land on an existing face (KD-tree NN).
+Detection: candidate planes pass through the area-weighted centroid with
+normals along the principal axes (PCA) plus global X/Y/Z. Each is scored by
+reflecting all face centroids and counting how many land on an existing face
+(KD-tree nearest neighbor with a face-size tolerance and mirrored-normal
+agreement — real triangulations are never exactly mirror-symmetric).
 
-Painting: there is no exact triangle-to-triangle mirror map on a real mesh — a
-chiral triangulation flips each quad's diagonal under reflection, and a
-sculpted model is only ~98% symmetric — so any per-triangle correspondence
-decided from a SINGLE sample point (the centroid) is a coin flip for every
-face the reflected boundary cuts through, which renders as sawtooth spikes.
-Instead each candidate face votes with several interior sample points: the
-face is painted iff the MAJORITY of its area, reflected through the plane,
-lands on painted source faces. That is a direct discretization of the only
-well-defined notion of "the mirrored region" on a differently-triangulated
-surface, so the boundary follows the reflected stroke as closely as the
-target triangulation allows.
+Painting does NOT use any face-to-face correspondence. Every correspondence/
+voting scheme discretizes twice (the source boundary is already a triangle
+zigzag around the smooth brush circle; re-discretizing that zigzag onto the
+differently-triangulated far side compounds the aliasing into sawtooth). The
+viewer instead mirrors the BRUSH: it renders a second ID-pass with the camera
+reflected through the plane and runs the identical screen-circle pick there,
+so both sides are first-order discretizations of the same smooth dab and look
+the same by construction. This module only supplies the plane (and the
+reflection matrix for that pass).
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import time
 from dataclasses import dataclass
 
 import numpy as np
-import trimesh
 from scipy.spatial import cKDTree
 
 from .mesh import PaintMesh
@@ -34,40 +33,13 @@ ACCEPT_FRACTION = 0.85
 TOLERANCE_FACE_SCALE = 1.0
 # spejlet normal skal pege samme vej som makkerens normal
 NORMAL_AGREEMENT = 0.8
-# søm-bro: bånd-bredde (i centroid-afstande) og maks. iterationer
-SEAM_BAND = 3.0
-SEAM_ITERS = 6
-# afstemning: indre barycentriske samplepunkter pr. kandidat-face (ulige antal,
-# spredt jævnt over fladen, så stemmeandelen approksimerer areal-andelen)
-VOTE_BARY = np.array(
-    [
-        [1 / 3, 1 / 3, 1 / 3],
-        [2 / 3, 1 / 6, 1 / 6],
-        [1 / 6, 2 / 3, 1 / 6],
-        [1 / 6, 1 / 6, 2 / 3],
-        [1 / 6, 5 / 12, 5 / 12],
-        [5 / 12, 1 / 6, 5 / 12],
-        [5 / 12, 5 / 12, 1 / 6],
-    ]
-)
-# sample-normal skal pege nogenlunde som kandidatens spejlede normal (afslappet
-# ift. detektionens 0.8 pga. krumning hen over en face)
-VOTE_NORMAL_AGREEMENT = 0.5
 
 
 @dataclass
 class MirrorMap:
-    face_map: np.ndarray      # (F,) face på hver faces spejl-position, -1 = ingen
-    adjacency: np.ndarray     # (E,2) face-nabopar, til hul-lukning og søm-bro
-    dside: np.ndarray         # (F,) signeret afstand til planet, pr. face
-    crossing: np.ndarray      # (F,) bool: trekanten skærer selv planet
-    spacing: float            # median centroid-afstand (bånd-skala)
-    normal: np.ndarray        # (3,) planets normal
-    origin: np.ndarray        # (3,) punkt i planet
-    match: float              # andel faces med makker (0..1)
-    tri: np.ndarray           # (F,3,3) trekant-hjørner, til sample-afstemning
-    face_normals: np.ndarray  # (F,3) face-normaler
-    tree: cKDTree             # KD-træ over centroider
+    normal: np.ndarray   # (3,) planets normal
+    origin: np.ndarray   # (3,) punkt i planet
+    match: float         # andel faces med spejl-makker (0..1)
 
     @property
     def axis_label(self) -> str:
@@ -77,178 +49,17 @@ class MirrorMap:
             return names[ax]
         return f"({self.normal[0]:.2f}, {self.normal[1]:.2f}, {self.normal[2]:.2f})"
 
-    def _fill_holes(self, faces: np.ndarray, passes: int = 2) -> np.ndarray:
-        """Fill fully-enclosed gaps (faces whose every edge-neighbor is painted).
+    def reflection_matrix(self) -> np.ndarray:
+        """4x4 world-space reflection through the plane (column-vector math).
 
-        Forward correspondence maps several source faces onto one mirror face,
-        leaving the odd interior face blank; filling only fully-surrounded faces
-        closes those speckles without growing the region's outer boundary.
+        p' = p - 2((p-o)·n)n  ⇒  M = [I-2nnᵀ | 2(o·n)n]. Determinant is -1:
+        the caller must flip triangle winding/culling when rendering with it.
         """
-        adj = self.adjacency
-        if len(adj) == 0 or len(faces) == 0:
-            return faces
-        n = len(self.dside)
-        a, b = adj[:, 0], adj[:, 1]
-        deg = np.bincount(a, minlength=n) + np.bincount(b, minlength=n)
-        for _ in range(passes):
-            painted = np.zeros(n, dtype=bool)
-            painted[faces] = True
-            pnb = np.bincount(a, painted[b], n) + np.bincount(b, painted[a], n)
-            holes = np.flatnonzero((~painted) & (deg > 0) & (pnb >= deg))
-            if len(holes) == 0:
-                break
-            faces = np.union1d(faces, holes)
-        return faces
-
-    def _bridge_seam(self, faces: np.ndarray) -> np.ndarray:
-        """Fill the gap between a stroke and its mirror across the plane.
-
-        A stroke near the plane and its mirror leave the faces in between
-        blank. That gap can be several faces wide, so a "painted neighbor on
-        both sides in one step" test never fires. Instead: flood the seam band
-        from the positive-side paint and from the negative-side paint
-        SEPARATELY (each flood bounded to SEAM_ITERS steps), and bridge the
-        intersection — exactly the faces sandwiched between paint on the two
-        sides, without spreading along the plane past the stroke.
-
-        The band is faces whose triangle actually crosses the plane plus those
-        with a near-plane centroid: tall thin triangles straddle the plane
-        with centroids far from it, so a centroid test alone misses them.
-        """
-        adj = self.adjacency
-        if len(adj) == 0 or len(faces) == 0:
-            return faces
-        n = len(self.dside)
-        painted = np.zeros(n, dtype=bool)
-        painted[faces] = True
-        band = self.crossing | (np.abs(self.dside) < SEAM_BAND * self.spacing)
-
-        a, b = adj[:, 0], adj[:, 1]
-
-        def flood_dist(seed_mask: np.ndarray) -> np.ndarray:
-            """BFS-afstand gennem båndet fra seed-malingen (inf = unåelig)."""
-            dist = np.full(n, np.inf)
-            frontier = seed_mask
-            for step in range(1, SEAM_ITERS + 1):
-                touched = np.zeros(n, dtype=bool)
-                touched[b[frontier[a]]] = True
-                touched[a[frontier[b]]] = True
-                new = touched & band & ~painted & ~np.isfinite(dist)
-                if not new.any():
-                    break
-                dist[new] = step
-                frontier = new
-            return dist
-
-        dpos = flood_dist(painted & (self.dside > 0))
-        dneg = flood_dist(painted & (self.dside < 0))
-        # kun faces på en KORT vej mellem de to sider broes — det fylder
-        # hullet på tværs af sømmen uden at brede sig langs planet
-        bridge = (dpos + dneg) <= SEAM_ITERS
-        if bridge.any():
-            painted |= bridge
-        return np.flatnonzero(painted)
-
-    def _grow(self, mask: np.ndarray, rings: int) -> np.ndarray:
-        """Expand a face mask by N adjacency rings."""
-        a, b = self.adjacency[:, 0], self.adjacency[:, 1]
-        for _ in range(rings):
-            nxt = mask.copy()
-            nxt[b[mask[a]]] = True
-            nxt[a[mask[b]]] = True
-            mask = nxt
-        return mask
-
-    def mirror(self, face_ids: np.ndarray) -> np.ndarray:
-        """The painted faces plus their area-majority mirror.
-
-        Candidates (the correspondence-mapped faces grown a couple of rings)
-        each cast VOTE_BARY interior sample points; every sample is reflected
-        through the plane and looked up in the source triangulation. A
-        candidate is painted iff the majority of its samples land on painted
-        faces — i.e. the majority of its area lies inside the reflected
-        stroke. The single-sample decision this replaces was a coin flip for
-        every boundary-cut face, which rendered as sawtooth spikes.
-        """
-        if len(face_ids) == 0:
-            return face_ids
-        n = len(self.face_map)
-        painted = np.zeros(n, dtype=bool)
-        painted[face_ids] = True
-
-        # kandidater: korrespondance-billedet begge veje + 2 ringe naboer
-        seedmask = np.zeros(n, dtype=bool)
-        forward = self.face_map[face_ids]
-        seedmask[forward[forward >= 0]] = True
-        seedmask |= np.isin(self.face_map, face_ids)
-        candidates = np.flatnonzero(self._grow(seedmask, 2) & ~painted)
-        if len(candidates) == 0:
-            return face_ids
-
-        # reflektér kandidaternes samplepunkter og find indeholdende kilde-face
-        samples = np.einsum("bk,fkx->fbx", VOTE_BARY, self.tri[candidates])
-        flat = samples.reshape(-1, 3)
-        refl = flat - 2.0 * (((flat - self.origin) @ self.normal)[:, None] * self.normal)
-        hits, _ = _containing_face(refl, self.tree, self.tri)
-
-        # en sample tæller kun hvis den lander på den rigtige overflade-side
-        mirrored_n = self.face_normals[candidates] - 2.0 * (
-            (self.face_normals[candidates] @ self.normal)[:, None] * self.normal
-        )
-        agree = (
-            np.repeat(mirrored_n, len(VOTE_BARY), axis=0) * self.face_normals[hits]
-        ).sum(axis=1) >= VOTE_NORMAL_AGREEMENT
-
-        votes = (painted[hits] & agree).reshape(len(candidates), -1)
-        accepted = candidates[votes.mean(axis=1) >= 0.5]
-
-        result = np.union1d(face_ids, accepted)
-        result = self._fill_holes(result)
-        return self._bridge_seam(result)
-
-
-def _containing_face(
-    points: np.ndarray, tree: cKDTree, tri: np.ndarray, k: int = 8
-) -> tuple[np.ndarray, np.ndarray]:
-    """For each point, the triangle that contains it (projected), and its distance.
-
-    Among the k nearest face centroids, test which triangle actually contains
-    the point (barycentric, projected onto the triangle plane) and pick the one
-    it sits closest to the plane of. This is robust where nearest-centroid fails
-    (e.g. a point near a quad diagonal). Points contained by no candidate fall
-    back to the nearest centroid.
-    """
-    k = min(k, tri.shape[0])
-    _, idx = tree.query(points, k=k, workers=-1)
-    if idx.ndim == 1:
-        idx = idx[:, None]
-    a, b, c = tri[idx, 0], tri[idx, 1], tri[idx, 2]      # (N, k, 3)
-    p = points[:, None, :]
-    v0, v1, v2 = b - a, c - a, p - a
-    d00 = (v0 * v0).sum(-1)
-    d01 = (v0 * v1).sum(-1)
-    d11 = (v1 * v1).sum(-1)
-    d20 = (v2 * v0).sum(-1)
-    d21 = (v2 * v1).sum(-1)
-    denom = d00 * d11 - d01 * d01
-    denom = np.where(np.abs(denom) < 1e-20, 1e-20, denom)
-    v = (d11 * d20 - d01 * d21) / denom
-    w = (d00 * d21 - d01 * d20) / denom
-    u = 1.0 - v - w
-    eps = 1e-6
-    inside = (u >= -eps) & (v >= -eps) & (w >= -eps)     # (N, k)
-    nf = np.cross(v0, v1)
-    nf /= np.maximum(np.linalg.norm(nf, axis=-1, keepdims=True), 1e-12)
-    perp = np.abs((v2 * nf).sum(-1))                     # afstand til trekantplanet
-    score = np.where(inside, perp, np.inf)
-    best = np.argmin(score, axis=1)
-    rows = np.arange(len(points))
-    chosen = idx[rows, best].copy()
-    dist = score[rows, best].copy()
-    none = ~inside.any(axis=1)
-    chosen[none] = idx[none, 0]
-    dist[none] = np.linalg.norm(points[none] - tri[idx[none, 0]].mean(1), axis=1)
-    return chosen, dist
+        n = self.normal / np.linalg.norm(self.normal)
+        m = np.eye(4)
+        m[:3, :3] -= 2.0 * np.outer(n, n)
+        m[:3, 3] = 2.0 * float(self.origin @ n) * n
+        return m
 
 
 def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
@@ -275,9 +86,7 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     face_scale = np.sqrt(np.maximum(areas, 1e-12))
     normals = cross / np.maximum(np.linalg.norm(cross, axis=1, keepdims=True), 1e-12)
 
-    # vælg det bedste kandidatplan via centroid-NN-scoring
-    best_n: np.ndarray | None = None
-    best_match = 0.0
+    best: MirrorMap | None = None
     for n in unique:
         reflected = centroids - 2.0 * ((d @ n)[:, None] * n)
         dist, idx = tree.query(reflected, workers=-1)
@@ -285,38 +94,15 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
         normal_ok = (mirrored_n * normals[idx]).sum(axis=1) >= NORMAL_AGREEMENT
         ok = (dist <= TOLERANCE_FACE_SCALE * face_scale[idx]) & normal_ok
         match = float(ok.mean())
-        if match >= ACCEPT_FRACTION and match > best_match:
-            best_match, best_n = match, n.copy()
+        if match >= ACCEPT_FRACTION and (best is None or match > best.match):
+            best = MirrorMap(n.copy(), center, match)
 
     elapsed = time.perf_counter() - t0
-    if best_n is None:
+    if best is None:
         print(f"Symmetri: intet spejlplan fundet ({elapsed:.2f}s)")
-        return None
-
-    nn_dist, _ = tree.query(centroids, k=2, workers=-1)   # [:,1] = nærmeste nabo
-    spacing = float(np.median(nn_dist[:, 1]))
-    tm = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
-    adjacency = np.asarray(tm.face_adjacency, dtype=np.int64)
-    dside = (centroids - center) @ best_n
-    vd = (verts - center) @ best_n                        # (F,3) vertex-afstande
-    crossing = (vd.min(axis=1) < 0) & (vd.max(axis=1) > 0)
-
-    # spejl-partner pr. face: hvilken trekant INDEHOLDER den reflekterede centroid
-    reflected = centroids - 2.0 * ((d @ best_n)[:, None] * best_n)
-    tri = mesh.vertices[mesh.faces]
-    idx, sdist = _containing_face(reflected, tree, tri)
-    mirrored_n = normals - 2.0 * ((normals @ best_n)[:, None] * best_n)
-    normal_ok = (mirrored_n * normals[idx]).sum(axis=1) >= NORMAL_AGREEMENT
-    ok = (sdist <= TOLERANCE_FACE_SCALE * face_scale[idx]) & normal_ok
-    face_map = np.where(ok, idx, -1).astype(np.int64)
-
-    best = MirrorMap(
-        face_map, adjacency, dside, crossing, spacing, best_n, center,
-        best_match, tri, normals, tree,
-    )
-
-    print(
-        f"Symmetri: spejlplan {best.axis_label}, "
-        f"{best.match:.1%} match ({time.perf_counter() - t0:.2f}s)"
-    )
+    else:
+        print(
+            f"Symmetri: spejlplan {best.axis_label}, "
+            f"{best.match:.1%} match ({elapsed:.2f}s)"
+        )
     return best
