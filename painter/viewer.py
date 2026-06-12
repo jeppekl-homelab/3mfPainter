@@ -219,8 +219,12 @@ class Viewer:
         children = np.array(list(index.values()), dtype=np.int64)   # (F, 4)
         parent[children] = np.fromiter(index.keys(), dtype=np.int64)[:, None]
         camera = self.camera
+        # spejlplanet er geometrisk og geometrien er uændret — bevar det, så
+        # detektionen ikke kører forfra (73s ved 21M faces)
+        mirror, searched = self._mirror, self._mirror_searched
         self.set_mesh(mesh_io.build(new_v, new_f))
         self.camera = camera
+        self._mirror, self._mirror_searched = mirror, searched
         self.paint.load_colors(colors[parent])
         print(f"Subdivision: {len(colors):,} -> {self.mesh.n_faces:,} faces")
 
@@ -513,7 +517,10 @@ class Viewer:
 
         imgui.text(f"Mesh: {self.mesh.n_faces:,} faces")
         imgui.same_line()
-        if imgui.small_button("Subdivide x4"):
+        # loft: 4x mere end dette giver multi-GB GPU-buffere og risiko for crash
+        if self.mesh.n_faces > 6_000_000:
+            imgui.text_disabled("(max resolution)")
+        elif imgui.small_button("Subdivide x4"):
             self.subdivide()
         if imgui.is_item_hovered():
             imgui.set_tooltip(
