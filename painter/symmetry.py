@@ -60,6 +60,7 @@ class MirrorMap:
     face_map: np.ndarray      # (F,) face på hver faces spejl-position, -1 = ingen
     adjacency: np.ndarray     # (E,2) face-nabopar, til hul-lukning og søm-bro
     dside: np.ndarray         # (F,) signeret afstand til planet, pr. face
+    crossing: np.ndarray      # (F,) bool: trekanten skærer selv planet
     spacing: float            # median centroid-afstand (bånd-skala)
     normal: np.ndarray        # (3,) planets normal
     origin: np.ndarray        # (3,) punkt i planet
@@ -100,32 +101,52 @@ class MirrorMap:
         return faces
 
     def _bridge_seam(self, faces: np.ndarray) -> np.ndarray:
-        """Fill faces straddling the plane that connect the two painted halves.
+        """Fill the gap between a stroke and its mirror across the plane.
 
-        A stroke running near the plane leaves the faces the plane cuts through
-        blank — the source reaches it from one side, the mirror from the other.
-        Grow paint into that band only through faces that have painted neighbors
-        on BOTH sides of the plane, so the gap is bridged without spreading paint
-        along the plane past the stroke.
+        A stroke near the plane and its mirror leave the faces in between
+        blank. That gap can be several faces wide, so a "painted neighbor on
+        both sides in one step" test never fires. Instead: flood the seam band
+        from the positive-side paint and from the negative-side paint
+        SEPARATELY (each flood bounded to SEAM_ITERS steps), and bridge the
+        intersection — exactly the faces sandwiched between paint on the two
+        sides, without spreading along the plane past the stroke.
+
+        The band is faces whose triangle actually crosses the plane plus those
+        with a near-plane centroid: tall thin triangles straddle the plane
+        with centroids far from it, so a centroid test alone misses them.
         """
         adj = self.adjacency
-        if len(adj) == 0:
+        if len(adj) == 0 or len(faces) == 0:
             return faces
         n = len(self.dside)
         painted = np.zeros(n, dtype=bool)
         painted[faces] = True
-        band = np.abs(self.dside) < SEAM_BAND * self.spacing
+        band = self.crossing | (np.abs(self.dside) < SEAM_BAND * self.spacing)
+
         a, b = adj[:, 0], adj[:, 1]
-        da, db = self.dside[a], self.dside[b]
-        for _ in range(SEAM_ITERS):
-            pos = (np.bincount(b, (painted[a] & (da > 0)).astype(float), n)
-                   + np.bincount(a, (painted[b] & (db > 0)).astype(float), n)) > 0
-            neg = (np.bincount(b, (painted[a] & (da < 0)).astype(float), n)
-                   + np.bincount(a, (painted[b] & (db < 0)).astype(float), n)) > 0
-            bridge = (~painted) & band & pos & neg
-            if not bridge.any():
-                break
-            painted[bridge] = True
+
+        def flood_dist(seed_mask: np.ndarray) -> np.ndarray:
+            """BFS-afstand gennem båndet fra seed-malingen (inf = unåelig)."""
+            dist = np.full(n, np.inf)
+            frontier = seed_mask
+            for step in range(1, SEAM_ITERS + 1):
+                touched = np.zeros(n, dtype=bool)
+                touched[b[frontier[a]]] = True
+                touched[a[frontier[b]]] = True
+                new = touched & band & ~painted & ~np.isfinite(dist)
+                if not new.any():
+                    break
+                dist[new] = step
+                frontier = new
+            return dist
+
+        dpos = flood_dist(painted & (self.dside > 0))
+        dneg = flood_dist(painted & (self.dside < 0))
+        # kun faces på en KORT vej mellem de to sider broes — det fylder
+        # hullet på tværs af sømmen uden at brede sig langs planet
+        bridge = (dpos + dneg) <= SEAM_ITERS
+        if bridge.any():
+            painted |= bridge
         return np.flatnonzero(painted)
 
     def _grow(self, mask: np.ndarray, rings: int) -> np.ndarray:
@@ -277,6 +298,8 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     tm = trimesh.Trimesh(mesh.vertices, mesh.faces, process=False)
     adjacency = np.asarray(tm.face_adjacency, dtype=np.int64)
     dside = (centroids - center) @ best_n
+    vd = (verts - center) @ best_n                        # (F,3) vertex-afstande
+    crossing = (vd.min(axis=1) < 0) & (vd.max(axis=1) > 0)
 
     # spejl-partner pr. face: hvilken trekant INDEHOLDER den reflekterede centroid
     reflected = centroids - 2.0 * ((d @ best_n)[:, None] * best_n)
@@ -288,8 +311,8 @@ def find_mirror(mesh: PaintMesh) -> MirrorMap | None:
     face_map = np.where(ok, idx, -1).astype(np.int64)
 
     best = MirrorMap(
-        face_map, adjacency, dside, spacing, best_n, center, best_match,
-        tri, normals, tree,
+        face_map, adjacency, dside, crossing, spacing, best_n, center,
+        best_match, tri, normals, tree,
     )
 
     print(
